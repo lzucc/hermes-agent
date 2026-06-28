@@ -241,6 +241,10 @@ class TestZulipDmChatId:
         result = _parse_dm_chat_id("dm:alice@example.com")
         assert result == "alice@example.com"
 
+    def test_parse_dm_chat_id_strips_double_prefix(self):
+        from gateway.platforms.zulip import _parse_dm_chat_id
+        assert _parse_dm_chat_id("dm:dm:alice@example.com") == "alice@example.com"
+
     def test_parse_dm_chat_id_roundtrip(self):
         from gateway.platforms.zulip import _build_dm_chat_id, _parse_dm_chat_id
         original = _build_dm_chat_id("bob@example.org")
@@ -3623,6 +3627,51 @@ class TestZulipSendTyping:
             "to": [123],
             "type": "direct",
             "op": "start",
+        })
+
+    @pytest.mark.asyncio
+    async def test_typing_dm_resolves_user_on_demand(self):
+        """DM typing should look up user_id via GET /users/{email} when cache is cold."""
+        adapter = _make_adapter()
+        adapter._client = MagicMock()
+        adapter._client.call_endpoint.return_value = {
+            "result": "success",
+            "user": {"user_id": 456},
+        }
+        adapter._client.set_typing_status.return_value = {"result": "success"}
+        adapter._build_send_client = MagicMock(return_value=adapter._client)
+
+        await adapter.send_typing("dm:alice@example.com")
+
+        adapter._client.call_endpoint.assert_called_once_with(
+            url="users/alice@example.com",
+            method="GET",
+        )
+        adapter._client.set_typing_status.assert_called_once_with({
+            "to": [456],
+            "type": "direct",
+            "op": "start",
+        })
+        assert adapter._user_id_cache["alice@example.com"] == 456
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_dm_resolves_user_on_demand(self):
+        """stop_typing must resolve user_id the same way as send_typing."""
+        adapter = _make_adapter()
+        adapter._client = MagicMock()
+        adapter._client.call_endpoint.return_value = {
+            "result": "success",
+            "user": {"user_id": 789},
+        }
+        adapter._client.set_typing_status.return_value = {"result": "success"}
+        adapter._build_send_client = MagicMock(return_value=adapter._client)
+
+        await adapter.stop_typing("dm:bob@example.com")
+
+        adapter._client.set_typing_status.assert_called_once_with({
+            "to": [789],
+            "type": "direct",
+            "op": "stop",
         })
 
     @pytest.mark.asyncio
