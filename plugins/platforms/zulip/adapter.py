@@ -289,9 +289,13 @@ def _parse_dm_chat_id(chat_id: str) -> Optional[str]:
 
     Returns ``None`` if *chat_id* does not look like a DM chat ID.
     """
-    if chat_id.startswith(_DM_PREFIX) and "@" in chat_id:
-        return chat_id[len(_DM_PREFIX):]
-    return None
+    if not chat_id.startswith(_DM_PREFIX) or "@" not in chat_id:
+        return None
+    email = chat_id[len(_DM_PREFIX):]
+    # Defensive: tolerate stale double-prefixed IDs (dm:dm:user@…).
+    while email.startswith(_DM_PREFIX):
+        email = email[len(_DM_PREFIX):]
+    return email
 
 
 def is_dm_chat_id(chat_id: str) -> bool:
@@ -605,7 +609,7 @@ class ZulipAdapter(BasePlatformAdapter):
         #
         # We populate this cache from every inbound private message's
         # "sender_id" (always present and numeric in Zulip events) and fall
-        # back to on-demand lookup via client.get_user(email=...) for the
+        # back to on-demand lookup via GET /users/{email} for the
         # (rare) case of an outbound DM typing indicator before any inbound
         # traffic from that user has been seen in the current process.
         self._user_id_cache: Dict[str, int] = {}
@@ -698,9 +702,15 @@ class ZulipAdapter(BasePlatformAdapter):
             self._site_url,
         )
 
-        # Populate stream-id cache early (helps typing indicators on first messages).
+        # Populate stream/user caches early (helps typing on first messages
+        # and after gateway restart before any inbound traffic arrives).
         self._refresh_stream_cache()
-        logger.debug("Zulip: adapter fully connected and ready (stream cache has %d entries so far)", len(self._stream_id_cache))
+        self._refresh_user_cache()
+        logger.debug(
+            "Zulip: adapter fully connected and ready (stream cache=%d, user cache=%d)",
+            len(self._stream_id_cache),
+            len(self._user_id_cache),
+        )
 
         # Start the event queue in a background thread.
         self._loop = asyncio.get_running_loop()
@@ -863,6 +873,10 @@ class ZulipAdapter(BasePlatformAdapter):
 
         request = self._build_typing_request(outbound_chat_id, op="stop")
         if not request:
+            logger.warning(
+                "Zulip: stop_typing failed — could not resolve chat_id %r (no request built)",
+                outbound_chat_id,
+            )
             return
 
         # Debug level only — stop is called on every turn completion and must
@@ -1584,8 +1598,8 @@ class ZulipAdapter(BasePlatformAdapter):
 
         We primarily populate the cache from inbound "sender_id" in
         _dispatch_inbound (Zulip always sends numeric IDs in message events).
-        This on-demand path (via the zulip client's get_user helper, which
-        does a /users/{email} lookup) is the fallback for the first outbound
+        This on-demand path (GET /users/{email} via call_endpoint) is the
+        fallback for the first outbound
         typing indicator to a user we have never received a message from yet.
         """
         if not email or not self._client:
@@ -1594,8 +1608,10 @@ class ZulipAdapter(BasePlatformAdapter):
         if key in self._user_id_cache:
             return self._user_id_cache[key]
         try:
-            # Standard zulip client helper
-            result = self._client.get_user(email=email)
+            result = self._client.call_endpoint(
+                url=f"users/{email}",
+                method="GET",
+            )
             if result.get("result") == "success":
                 user = result.get("user") or {}
                 uid = user.get("user_id")
@@ -2229,6 +2245,31 @@ class ZulipAdapter(BasePlatformAdapter):
                 )
         except Exception as exc:
             logger.warning("Zulip: failed to fetch streams — %s", exc)
+
+    def _refresh_user_cache(self) -> None:
+        """Fetch organization users and cache email → user_id for DM typing."""
+        if not self._client:
+            return
+        try:
+            result = self._client.get_users()
+            if result.get("result") != "success":
+                return
+            count = 0
+            for user in result.get("members", []):
+                uid = user.get("user_id")
+                if not uid:
+                    continue
+                for email_key in (
+                    user.get("email"),
+                    user.get("delivery_email"),
+                ):
+                    if email_key and "@" in email_key:
+                        self._user_id_cache[email_key.lower()] = uid
+                        count += 1
+            if count:
+                logger.info("Zulip: cached %d user email(s) for typing", count)
+        except Exception as exc:
+            logger.warning("Zulip: failed to fetch users — %s", exc)
 
     def _prune_seen(self) -> None:
         """Remove expired entries from the dedup cache."""
