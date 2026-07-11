@@ -1341,15 +1341,27 @@ class SessionStore:
         requested_session_key: str,
         recovered: Dict[str, Any],
     ) -> bool:
-        """Prevent non-multiplexed gateways from reviving another profile's row."""
-        if getattr(self.config, "multiplex_profiles", False):
-            return True
+        """Prevent session recovery from reviving the wrong profile's row.
 
+        Under multiplex, many profiles share the same SessionStore / state.db
+        and the same peer tuple (platform + user + chat_id). Peer-tuple
+        fallback recovery must NOT attach profile B's inbound to profile A's
+        open transcript — that makes secondary bots answer from the default
+        conversation (and surface system traffic on the wrong bot).
+        """
         recovered_key = str(recovered.get("session_key") or "")
         if not recovered_key or recovered_key == requested_session_key:
             return True
 
         recovered_profile = self._profile_from_session_key(recovered_key)
+        requested_profile = self._profile_from_session_key(requested_session_key)
+
+        if getattr(self.config, "multiplex_profiles", False):
+            # Same profile namespace only (agent:amc12:* never reuses agent:main:*)
+            if recovered_profile is None or requested_profile is None:
+                return recovered_profile == requested_profile
+            return recovered_profile == requested_profile
+
         if recovered_profile is None:
             return True
 

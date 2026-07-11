@@ -2057,25 +2057,55 @@ class SessionDB:
             # Conservative fallback for rows created by current code but with a
             # temporarily-missing exact key: still require the complete peer
             # tuple so we never cross chats/threads/users.
+            #
+            # ALSO require the same session_key *profile namespace* (agent:<name>).
+            # Under multiplex, multiple profiles share one state.db and the same
+            # Zulip DM peer tuple; without this filter, profile B reopens
+            # profile A's live transcript.
             if chat_id is None or chat_type is None:
                 return None
-            row = self._conn.execute(
-                """
-                SELECT * FROM sessions
-                WHERE source = ?
-                  AND COALESCE(user_id, '') = COALESCE(?, '')
-                  AND COALESCE(chat_id, '') = COALESCE(?, '')
-                  AND COALESCE(chat_type, '') = COALESCE(?, '')
-                  AND COALESCE(thread_id, '') = COALESCE(?, '')
-                  AND (ended_at IS NULL OR end_reason = 'agent_close')
-                  AND (COALESCE(message_count, 0) > 0 OR EXISTS (
-                      SELECT 1 FROM messages WHERE messages.session_id = sessions.id LIMIT 1
-                  ))
-                ORDER BY started_at DESC
-                LIMIT 1
-                """,
-                (source, user_id, chat_id, chat_type, thread_id),
-            ).fetchone()
+            parts = str(session_key).split(":")
+            if len(parts) >= 2 and parts[0] == "agent":
+                key_prefix = f"agent:{parts[1]}:"
+            else:
+                key_prefix = None
+            if key_prefix:
+                row = self._conn.execute(
+                    """
+                    SELECT * FROM sessions
+                    WHERE source = ?
+                      AND COALESCE(user_id, '') = COALESCE(?, '')
+                      AND COALESCE(chat_id, '') = COALESCE(?, '')
+                      AND COALESCE(chat_type, '') = COALESCE(?, '')
+                      AND COALESCE(thread_id, '') = COALESCE(?, '')
+                      AND (session_key IS NULL OR session_key = '' OR session_key LIKE ?)
+                      AND (ended_at IS NULL OR end_reason = 'agent_close')
+                      AND (COALESCE(message_count, 0) > 0 OR EXISTS (
+                          SELECT 1 FROM messages WHERE messages.session_id = sessions.id LIMIT 1
+                      ))
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """,
+                    (source, user_id, chat_id, chat_type, thread_id, key_prefix + "%"),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    """
+                    SELECT * FROM sessions
+                    WHERE source = ?
+                      AND COALESCE(user_id, '') = COALESCE(?, '')
+                      AND COALESCE(chat_id, '') = COALESCE(?, '')
+                      AND COALESCE(chat_type, '') = COALESCE(?, '')
+                      AND COALESCE(thread_id, '') = COALESCE(?, '')
+                      AND (ended_at IS NULL OR end_reason = 'agent_close')
+                      AND (COALESCE(message_count, 0) > 0 OR EXISTS (
+                          SELECT 1 FROM messages WHERE messages.session_id = sessions.id LIMIT 1
+                      ))
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """,
+                    (source, user_id, chat_id, chat_type, thread_id),
+                ).fetchone()
         return dict(row) if row else None
 
     def end_session(self, session_id: str, end_reason: str) -> None:
