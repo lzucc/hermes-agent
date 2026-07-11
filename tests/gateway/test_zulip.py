@@ -89,6 +89,44 @@ class TestZulipConfigLoading:
         assert seed["home_topic"] == "notifications"
         assert seed["home_channel"]["chat_id"] == "general:notifications"
 
+    def test_env_enablement_and_adapter_honor_secret_scope(self, monkeypatch):
+        """Multiplex secondary profiles must not inherit the default bot credentials.
+
+        Process-global os.environ holds the default profile's ZULIP_*; the
+        active secret scope must win for env_enablement + adapter construction.
+        """
+        monkeypatch.setenv("ZULIP_API_KEY", "default-key")
+        monkeypatch.setenv("ZULIP_BOT_EMAIL", "default-bot@example.com")
+        monkeypatch.setenv("ZULIP_SITE_URL", "https://default.example.com")
+
+        from agent.secret_scope import set_secret_scope, reset_secret_scope
+        from plugins.platforms.zulip.adapter import (
+            ZulipAdapter,
+            _env,
+            _env_enablement,
+        )
+
+        token = set_secret_scope({
+            "ZULIP_API_KEY": "profile-key",
+            "ZULIP_BOT_EMAIL": "amc12-bot@example.com",
+            "ZULIP_SITE_URL": "https://profile.example.com",
+        })
+        try:
+            assert _env("ZULIP_BOT_EMAIL") == "amc12-bot@example.com"
+            assert _env("ZULIP_API_KEY") == "profile-key"
+            seed = _env_enablement()
+            assert seed["bot_email"] == "amc12-bot@example.com"
+            assert seed["site_url"] == "https://profile.example.com"
+            adapter = ZulipAdapter(PlatformConfig(
+                enabled=True,
+                extra=seed,
+            ))
+            assert adapter._bot_email == "amc12-bot@example.com"
+            assert adapter._api_key == "profile-key"
+            assert adapter._site_url == "https://profile.example.com"
+        finally:
+            reset_secret_scope(token)
+
     def test_zulip_not_loaded_without_creds(self, monkeypatch):
         """Zulip should be absent when neither credentials nor routing env are set."""
         for key in (

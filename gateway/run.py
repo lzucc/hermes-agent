@@ -8647,16 +8647,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         we don't attempt conflict detection for it).
         """
         token = None
-        for attr in ("token", "bot_token", "_token", "api_token", "_bot_token"):
+        # Include _api_key (Zulip) / api_key so multiplex same-credential
+        # detection works for plugins that don't use "token"/"bot_token".
+        for attr in (
+            "token", "bot_token", "_token", "api_token", "_bot_token",
+            "_api_key", "api_key",
+        ):
             val = getattr(adapter, attr, None)
             if isinstance(val, str) and val.strip():
                 token = val.strip()
                 break
         if not token:
             config = getattr(adapter, "config", None)
-            val = getattr(config, "token", None)
-            if isinstance(val, str) and val.strip():
-                token = val.strip()
+            for attr in ("token", "api_key"):
+                val = getattr(config, attr, None) if config is not None else None
+                if isinstance(val, str) and val.strip():
+                    token = val.strip()
+                    break
         if not token:
             return None
         import hashlib

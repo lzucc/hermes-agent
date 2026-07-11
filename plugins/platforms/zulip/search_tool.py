@@ -16,10 +16,20 @@ logger = logging.getLogger(__name__)
 
 
 def _get_zulip_credentials() -> tuple[str, str, str]:
-    """Return Zulip ``(site_url, bot_email, api_key)`` from env or config."""
-    site_url = os.getenv("ZULIP_SITE_URL", "").rstrip("/")
-    bot_email = os.getenv("ZULIP_BOT_EMAIL", "")
-    api_key = os.getenv("ZULIP_API_KEY", "")
+    """Return Zulip ``(site_url, bot_email, api_key)`` from env or config.
+
+    Prefer the multiplex-aware ``_env`` helper so secondary profiles under
+    ``gateway.multiplex_profiles`` resolve their own bot credentials.
+    """
+    try:
+        from plugins.platforms.zulip.adapter import _env
+    except Exception:
+        def _env(name: str, default: str = "") -> str:  # type: ignore[misc]
+            return os.getenv(name, default) or default
+
+    site_url = _env("ZULIP_SITE_URL", "").rstrip("/")
+    bot_email = _env("ZULIP_BOT_EMAIL", "")
+    api_key = _env("ZULIP_API_KEY", "")
 
     try:
         from gateway.config import Platform, load_gateway_config
