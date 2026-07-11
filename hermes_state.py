@@ -1760,7 +1760,37 @@ class SessionDB:
         if not session_id or not session_key:
             return
 
+        def _profile_ns(key: str) -> Optional[str]:
+            parts = str(key or "").split(":")
+            if len(parts) >= 2 and parts[0] == "agent":
+                return parts[1] or "main"
+            return None
+
         def _do(conn):
+            # Never rewrite session_key across profile namespaces. Under
+            # multiplex, a recovered/mis-routed peer record used to steal the
+            # default profile's open transcript by SET session_key=agent:amc12…
+            # on a row that was agent:main:… — secondary bots then answered
+            # from default history forever.
+            existing = conn.execute(
+                "SELECT session_key FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            existing_key = ""
+            if existing is not None:
+                existing_key = existing["session_key"] if isinstance(existing, dict) else existing[0]
+                existing_key = existing_key or ""
+            write_key = session_key
+            if existing_key:
+                old_ns = _profile_ns(existing_key)
+                new_ns = _profile_ns(session_key)
+                if old_ns and new_ns and old_ns != new_ns:
+                    logger.warning(
+                        "record_gateway_session_peer: refusing to reassign "
+                        "session %s from key %r to %r (cross-profile)",
+                        session_id, existing_key, session_key,
+                    )
+                    write_key = existing_key
             conn.execute(
                 """UPDATE sessions
                    SET session_key = ?, source = ?, user_id = ?, chat_id = ?,
@@ -1769,7 +1799,7 @@ class SessionDB:
                        origin_json = COALESCE(?, origin_json)
                    WHERE id = ?""",
                 (
-                    session_key,
+                    write_key,
                     source,
                     user_id,
                     chat_id,
