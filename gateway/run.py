@@ -8601,6 +8601,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Stamp every inbound event from this adapter with its profile so
             # the agent turn (and session key) resolve to the right home.
+            # set_owned_profile also stamps at handle_message entry so busy
+            # acks ("⚡ Interrupting…") use this bot, not the default's.
+            if hasattr(adapter, "set_owned_profile"):
+                adapter.set_owned_profile(profile_name)
             adapter.set_message_handler(
                 self._make_profile_message_handler(profile_name)
             )

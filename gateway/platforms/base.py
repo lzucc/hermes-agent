@@ -2374,6 +2374,13 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+        # Multiplex ownership: secondary-profile adapters are tagged with the
+        # profile they serve so inbound events get source.profile stamped
+        # *before* session-key construction and busy-session acks. Without
+        # this, build_session_key() omits the profile namespace and
+        # _adapter_for_source() falls back to the default bot — so hints like
+        # "⚡ Interrupting current task..." land on the wrong profile.
+        self._owned_profile: Optional[str] = None
         # Optional authorization check, registered by GatewayRunner. Used by
         # adapters that fetch external context (e.g. Slack thread history) to
         # mark senders not on the allowlist as unverified in LLM context,
@@ -2811,6 +2818,36 @@ class BasePlatformAdapter(ABC):
     def set_busy_session_handler(self, handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]]) -> None:
         """Set an optional handler for messages arriving during active sessions."""
         self._busy_session_handler = handler
+
+    def set_owned_profile(self, profile_name: Optional[str]) -> None:
+        """Tag this adapter as serving *profile_name* in a multiplex gateway.
+
+        Must be set on secondary-profile adapters before they receive traffic
+        so session keys and busy acks resolve to this profile's bot, not the
+        default profile's.
+        """
+        name = (profile_name or "").strip() or None
+        if name == "default":
+            name = None  # default profile keeps agent:main namespace
+        self._owned_profile = name
+
+    def _stamp_owned_profile(self, event: MessageEvent) -> None:
+        """Ensure ``event.source.profile`` matches this adapter's ownership."""
+        owned = getattr(self, "_owned_profile", None)
+        if not owned:
+            return
+        source = getattr(event, "source", None)
+        if source is None:
+            return
+        if getattr(source, "profile", None):
+            return
+        try:
+            event.source = dataclasses.replace(source, profile=owned)
+        except Exception:
+            try:
+                source.profile = owned
+            except Exception:
+                logger.debug("failed to stamp owned profile on event source", exc_info=True)
 
     def set_authorization_check(
         self,
@@ -4601,10 +4638,17 @@ class BasePlatformAdapter(ABC):
         # Offloaded: the sync hook must not block the loop.
         await asyncio.to_thread(self._apply_topic_recovery, event)
 
+        # Stamp multiplex ownership BEFORE session-key construction and the
+        # busy-session path. The runner's message-handler wrapper also stamps
+        # profile, but that runs later — busy acks need the stamp here so
+        # _adapter_for_source() selects this adapter's bot, not the default.
+        self._stamp_owned_profile(event)
+
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=getattr(event.source, "profile", None),
         )
 
         # On-entry self-heal: if the adapter still has an _active_sessions
