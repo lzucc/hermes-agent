@@ -556,6 +556,55 @@ class ZulipAdapter(BasePlatformAdapter):
             "ZULIP_REQUIRE_MENTION", "true"
         ).lower() not in ("false", "0", "no")
 
+        # Bot-to-bot conversation policy — three modes:
+        #   block   → drop every inbound message from another realm bot
+        #             (safe fallback / emergency loop-break)
+        #   limited → allow bot conversations but enforce circuit breakers
+        #             on rate and trivial-content repetition per
+        #             (sender, conversation) pair. This is the default:
+        #             two Hermes bots can genuinely talk, but a runaway
+        #             loop is auto-broken within seconds.  No cap on total
+        #             turns — long legitimate conversations are allowed.
+        #   allow   → no restrictions (dev/test only).
+        #
+        # ZULIP_ALLOWED_BOT_SENDERS (comma-separated emails) always
+        # bypasses the guard entirely — use for deliberate orchestrator
+        # bots you trust.
+        policy_raw = _env("ZULIP_BOT_POLICY", "limited").strip().lower()
+        self._bot_policy: str = (
+            policy_raw if policy_raw in ("block", "limited", "allow")
+            else "limited"
+        )
+        self._allowed_bot_senders: set = {
+            s.strip().lower()
+            for s in _env("ZULIP_ALLOWED_BOT_SENDERS", "").split(",")
+            if s.strip()
+        }
+        # Circuit-breaker thresholds (policy=limited only).
+        self._bot_rate_max: int = int(
+            _env("ZULIP_BOT_RATE_MAX", "5") or "5"
+        )
+        self._bot_rate_window: float = float(
+            _env("ZULIP_BOT_RATE_WINDOW", "30") or "30"
+        )
+        self._bot_rate_cooldown: float = float(
+            _env("ZULIP_BOT_RATE_COOLDOWN", "60") or "60"
+        )
+        self._bot_repeat_k: int = int(
+            _env("ZULIP_BOT_REPEAT_K", "3") or "3"
+        )
+        self._bot_repeat_trivial_len: int = int(
+            _env("ZULIP_BOT_REPEAT_TRIVIAL_LEN", "5") or "5"
+        )
+        # Per-conversation counters, keyed by (sender_user_id, recipient_id, topic).
+        # Structure per entry:
+        #   {"timestamps": deque[float],   # sliding window for rate check
+        #    "contents":   deque[str],     # last K contents for repetition check
+        #    "total":      int,            # cumulative msg count
+        #    "blocked_until": float,       # soft cooldown expiry (unix ts)
+        #    "hard_blocked":  bool}        # sticky until process restart
+        self._bot_convo_state: Dict[tuple, dict] = {}
+
         free_streams_raw = _env("ZULIP_FREE_RESPONSE_STREAMS", "")
         self._free_response_streams: set = {
             s.strip().lower()
@@ -641,6 +690,9 @@ class ZulipAdapter(BasePlatformAdapter):
         # (rare) case of an outbound DM typing indicator before any inbound
         # traffic from that user has been seen in the current process.
         self._user_id_cache: Dict[str, int] = {}
+        # Realm bot user_ids — populated by `_refresh_user_cache`, used by the
+        # inbound bot-to-bot reflection guard (ZULIP_IGNORE_BOTS).
+        self._bot_user_ids: set = set()
 
         # Graceful shutdown: event that wakes the event-queue thread
         # immediately when disconnect() is called, instead of waiting
@@ -783,6 +835,8 @@ class ZulipAdapter(BasePlatformAdapter):
         self._stream_id_cache.clear()
         self._stream_name_cache.clear()
         self._user_id_cache.clear()
+        self._bot_user_ids.clear()
+        self._bot_convo_state.clear()
         self._consecutive_failures = 0
 
         self._mark_disconnected()
@@ -1944,6 +1998,28 @@ class ZulipAdapter(BasePlatformAdapter):
         if sender_email == self._bot_email or sender_id == self._bot_user_id:
             return
 
+        # Bot-to-bot conversation guard.  Zulip messages do NOT expose
+        # `sender_is_bot`, so we consult the bot user_id cache populated by
+        # `_refresh_user_cache`.  Behaviour is driven by ZULIP_BOT_POLICY:
+        #   block   → drop unconditionally
+        #   limited → allow, but enforce rate / repetition / total-turns
+        #             circuit breakers per conversation (default)
+        #   allow   → no filtering
+        # Emails in ZULIP_ALLOWED_BOT_SENDERS bypass the guard entirely.
+        if sender_id in self._bot_user_ids and self._bot_policy != "allow":
+            if sender_email.strip().lower() not in self._allowed_bot_senders:
+                if self._bot_policy == "block":
+                    logger.info(
+                        "Zulip: dropping bot message sender=%s "
+                        "(policy=block)",
+                        sender_email,
+                    )
+                    return
+                # policy=limited → run circuit breakers.
+                if not self._bot_conversation_allowed(message):
+                    return
+
+
         # Schedule async processing on the main event loop.
         msg_type_log = message.get("type", "unknown")
         logger.debug(
@@ -2274,8 +2350,119 @@ class ZulipAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("Zulip: failed to fetch streams — %s", exc)
 
+    def _bot_conversation_allowed(self, message: dict) -> bool:
+        """Circuit breakers for bot-to-bot conversations (policy=limited).
+
+        Returns True if the message should be processed, False to drop it.
+        Two breakers, keyed per (sender_user_id, conversation):
+
+        (1) Rate breaker (SOFT): more than _bot_rate_max messages within
+            _bot_rate_window seconds → cool down for _bot_rate_cooldown seconds,
+            then auto-recover.  Catches "reply every 3s" runaway loops.
+
+        (2) Repetition breaker (HARD): last _bot_repeat_k messages are all
+            identical, OR all short enough (≤ _bot_repeat_trivial_len chars) —
+            the signature of a degenerate "." / "(silent)" ping-pong.
+            Sticky until process restart.
+
+        There is no total-turns cap: long legitimate conversations pass
+        through freely.  Hard breaks stay set to prevent the loop from
+        resuming the moment the cooldown expires — a genuinely stuck peer
+        will not self-heal.  Operator can clear by restarting the gateway.
+        """
+        from collections import deque
+        now = time.time()
+        sender_id = message.get("sender_id", -1)
+
+        # Conversation key: DMs use the recipient_id (which is the Zulip
+        # conversation id for that DM/group-DM); streams use stream+topic.
+        if message.get("type") == "stream":
+            convo_key = (
+                sender_id,
+                "stream",
+                message.get("stream_id") or message.get("display_recipient"),
+                message.get("subject", ""),
+            )
+        else:
+            convo_key = (
+                sender_id,
+                "dm",
+                message.get("recipient_id", 0),
+            )
+
+        state = self._bot_convo_state.get(convo_key)
+        if state is None:
+            state = {
+                "timestamps": deque(maxlen=max(self._bot_rate_max * 4, 20)),
+                "contents": deque(maxlen=max(self._bot_repeat_k, 3)),
+                "total": 0,
+                "blocked_until": 0.0,
+                "hard_blocked": False,
+            }
+            self._bot_convo_state[convo_key] = state
+
+        sender_email = message.get("sender_email", "?")
+
+        # (0) Sticky hard-block from a previous trip.
+        if state["hard_blocked"]:
+            logger.debug(
+                "Zulip: bot msg dropped (hard-blocked convo) sender=%s key=%s",
+                sender_email, convo_key,
+            )
+            return False
+
+        # (1) Soft cooldown from a prior rate trip.
+        if now < state["blocked_until"]:
+            remaining = int(state["blocked_until"] - now)
+            logger.debug(
+                "Zulip: bot msg dropped (rate cooldown %ds left) sender=%s",
+                remaining, sender_email,
+            )
+            return False
+
+        # Record this message BEFORE evaluating breakers so counters reflect it.
+        state["timestamps"].append(now)
+        content = (message.get("content") or "").strip()
+        state["contents"].append(content)
+        state["total"] += 1  # kept for observability/logs; no cap enforced
+
+        # (a) Rate breaker.
+        window_start = now - self._bot_rate_window
+        recent = sum(1 for t in state["timestamps"] if t >= window_start)
+        if recent > self._bot_rate_max:
+            state["blocked_until"] = now + self._bot_rate_cooldown
+            logger.warning(
+                "Zulip: bot-conversation rate breaker tripped — %d msgs in %.0fs "
+                "from %s; cooling down %.0fs. key=%s",
+                recent, self._bot_rate_window, sender_email,
+                self._bot_rate_cooldown, convo_key,
+            )
+            return False
+
+        # (b) Repetition breaker — need at least K messages to evaluate.
+        if len(state["contents"]) >= self._bot_repeat_k:
+            last_k = list(state["contents"])[-self._bot_repeat_k:]
+            all_trivial = all(
+                len(c) <= self._bot_repeat_trivial_len for c in last_k
+            )
+            all_same = len(set(last_k)) == 1
+            if all_trivial or all_same:
+                state["hard_blocked"] = True
+                logger.warning(
+                    "Zulip: bot-conversation repetition breaker tripped — "
+                    "last %d msgs from %s were %s. HARD-blocking convo "
+                    "until gateway restart. key=%s samples=%r",
+                    self._bot_repeat_k, sender_email,
+                    "identical" if all_same else "all trivial",
+                    convo_key, last_k,
+                )
+                return False
+
+        return True
+
     def _refresh_user_cache(self) -> None:
-        """Fetch organization users and cache email → user_id for DM typing."""
+        """Fetch organization users and cache email → user_id for DM typing,
+        plus the set of user_ids that are bots (for reflection-loop guard)."""
         if not self._client:
             return
         try:
@@ -2283,10 +2470,13 @@ class ZulipAdapter(BasePlatformAdapter):
             if result.get("result") != "success":
                 return
             count = 0
+            bot_ids: set = set()
             for user in result.get("members", []):
                 uid = user.get("user_id")
                 if not uid:
                     continue
+                if user.get("is_bot"):
+                    bot_ids.add(uid)
                 for email_key in (
                     user.get("email"),
                     user.get("delivery_email"),
@@ -2294,8 +2484,14 @@ class ZulipAdapter(BasePlatformAdapter):
                     if email_key and "@" in email_key:
                         self._user_id_cache[email_key.lower()] = uid
                         count += 1
+            self._bot_user_ids = bot_ids
             if count:
-                logger.info("Zulip: cached %d user email(s) for typing", count)
+                logger.info(
+                    "Zulip: cached %d user email(s) for typing "
+                    "(%d bot(s))",
+                    count,
+                    len(bot_ids),
+                )
         except Exception as exc:
             logger.warning("Zulip: failed to fetch users — %s", exc)
 
