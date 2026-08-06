@@ -12,6 +12,7 @@ import logging
 import os
 import re
 from typing import Any, Dict, List, Optional
+from .adapter import _env
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +41,9 @@ _SEARCH_OPERATOR_RE = re.compile(
 
 def _get_zulip_credentials(platform_config: Any = None) -> tuple[str, str, str]:
     """Return Zulip ``(site_url, bot_email, api_key)`` from env or config."""
-    site_url = os.getenv("ZULIP_SITE_URL", "").rstrip("/")
-    bot_email = os.getenv("ZULIP_BOT_EMAIL", "")
-    api_key = os.getenv("ZULIP_API_KEY", "")
+    site_url = _env("ZULIP_SITE_URL", "").rstrip("/")
+    bot_email = _env("ZULIP_BOT_EMAIL", "")
+    api_key = _env("ZULIP_API_KEY", "")
 
     if platform_config is None:
         try:
