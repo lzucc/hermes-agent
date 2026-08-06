@@ -13557,6 +13557,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "_token",
             "api_token",
             "_bot_token",
+            # Zulip stores the bot API key on `_api_key` / config.api_key.
+            "_api_key",
+            "api_key",
             # Photon/Spectrum authenticates with project credentials instead
             # of a bot token. Including its secret keeps multiplexed profiles
             # from spawning competing sidecars for the same account and port.
@@ -13575,7 +13578,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not token:
             cfg = getattr(adapter, "config", None)
             if cfg is not None:
-                for attr in ("token", "bot_token"):
+                for attr in ("token", "bot_token", "api_key"):
                     val = getattr(cfg, attr, None)
                     if isinstance(val, str) and val.strip():
                         token = val.strip()

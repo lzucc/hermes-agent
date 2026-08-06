@@ -62,6 +62,33 @@ from .attachments import download_zulip_upload, extract_upload_paths
 
 logger = logging.getLogger(__name__)
 
+
+def _env(name: str, default: str = "") -> str:
+    """Read a Zulip env var, honoring multiplex profile secret scopes.
+
+    Under ``gateway.multiplex_profiles``, secondary profiles load credentials
+    via ``set_secret_scope`` (a contextvar) — **not** process-global
+    ``os.environ``. Raw ``os.getenv`` always sees the default profile's
+    ``ZULIP_*`` values, so every secondary adapter would authenticate as the
+    default bot.
+
+    Resolution:
+      1. Active secret scope → ``get_secret`` (profile's ``.env``)
+      2. Otherwise → ``os.environ`` (single-profile / default-gateway path)
+    """
+    try:
+        from agent.secret_scope import current_secret_scope, get_secret
+
+        if current_secret_scope() is not None:
+            val = get_secret(name, None)
+            if val is not None:
+                return str(val)
+            return default
+    except Exception:
+        pass
+    return os.getenv(name, default) if default is not None else (os.getenv(name) or "")
+
+
 # Zulip's standard server limit is 10,000 Unicode code points. Self-hosted
 # realms may configure a different limit; keep Hermes at the standard maximum
 # so normal responses arrive as one message whenever the realm permits it.
@@ -629,9 +656,9 @@ def check_zulip_requirements(config: Optional[PlatformConfig] = None) -> bool:
     """
     extra = config.extra if config else {}
     configured_key = (config.token or config.api_key) if config else ""
-    api_key = configured_key or os.getenv("ZULIP_API_KEY", "")
-    email = extra.get("bot_email") or os.getenv("ZULIP_BOT_EMAIL", "")
-    site = extra.get("site_url") or os.getenv("ZULIP_SITE_URL", "")
+    api_key = configured_key or _env("ZULIP_API_KEY", "")
+    email = extra.get("bot_email") or _env("ZULIP_BOT_EMAIL", "")
+    site = extra.get("site_url") or _env("ZULIP_SITE_URL", "")
 
     if not api_key:
         logger.debug("Zulip: ZULIP_API_KEY not set")
@@ -677,27 +704,27 @@ class ZulipAdapter(BasePlatformAdapter):
 
         self._site_url: str = (
             config.extra.get("site_url", "")
-            or os.getenv("ZULIP_SITE_URL", "")
+            or _env("ZULIP_SITE_URL", "")
         ).rstrip("/")
         self._bot_email: str = (
             config.extra.get("bot_email", "")
-            or os.getenv("ZULIP_BOT_EMAIL", "")
+            or _env("ZULIP_BOT_EMAIL", "")
         )
         self._api_key: str = (
             config.token
             or config.api_key
-            or os.getenv("ZULIP_API_KEY", "")
+            or _env("ZULIP_API_KEY", "")
         )
         self._default_stream: str = (
             config.extra.get("default_stream", "")
-            or os.getenv("ZULIP_DEFAULT_STREAM", "")
+            or _env("ZULIP_DEFAULT_STREAM", "")
         )
         self._home_topic: str = (
             config.extra.get("home_topic", "")
-            or os.getenv("ZULIP_HOME_TOPIC", "")
+            or _env("ZULIP_HOME_TOPIC", "")
         )
-        self._cert_bundle: str = os.getenv("ZULIP_CERT_BUNDLE", "")
-        self._allow_insecure: bool = os.getenv(
+        self._cert_bundle: str = _env("ZULIP_CERT_BUNDLE", "")
+        self._allow_insecure: bool = _env(
             "ZULIP_ALLOW_INSECURE", "false"
         ).lower() in ("true", "1", "yes")
         self._streaming_edits_warning_logged = False
@@ -707,12 +734,12 @@ class ZulipAdapter(BasePlatformAdapter):
         if "convert_math" in config.extra:
             self._convert_math = bool(config.extra.get("convert_math"))
         else:
-            self._convert_math = os.getenv(
+            self._convert_math = _env(
                 "ZULIP_CONVERT_MATH", "true"
             ).lower() in ("true", "1", "yes")
 
         # Mention gating configuration (follows Discord's pattern).
-        self._require_mention: bool = os.getenv(
+        self._require_mention: bool = _env(
             "ZULIP_REQUIRE_MENTION", "true"
         ).lower() not in ("false", "0", "no")
 
@@ -721,40 +748,40 @@ class ZulipAdapter(BasePlatformAdapter):
         #   limited → private DMs only + A2A prefix + rate/repetition breakers
         #   allow   → no bot filtering (dev/test only)
         # ZULIP_ALLOWED_BOT_SENDERS bypasses the gate entirely.
-        policy_raw = os.getenv("ZULIP_BOT_POLICY", "limited").strip().lower()
+        policy_raw = _env("ZULIP_BOT_POLICY", "limited").strip().lower()
         self._bot_policy: str = (
             policy_raw if policy_raw in ("block", "limited", "allow")
             else "limited"
         )
         self._allowed_bot_senders: set = {
             s.strip().lower()
-            for s in os.getenv("ZULIP_ALLOWED_BOT_SENDERS", "").split(",")
+            for s in _env("ZULIP_ALLOWED_BOT_SENDERS", "").split(",")
             if s.strip()
         }
         self._a2a_prefix: str = (
-            os.getenv("ZULIP_A2A_PREFIX", DEFAULT_A2A_PREFIX).strip()
+            _env("ZULIP_A2A_PREFIX", DEFAULT_A2A_PREFIX).strip()
             or DEFAULT_A2A_PREFIX
         )
         self._a2a_reply_chats: set = set()
         self._bot_rate_max: int = int(
-            os.getenv("ZULIP_BOT_RATE_MAX", "5") or "5"
+            _env("ZULIP_BOT_RATE_MAX", "5") or "5"
         )
         self._bot_rate_window: float = float(
-            os.getenv("ZULIP_BOT_RATE_WINDOW", "30") or "30"
+            _env("ZULIP_BOT_RATE_WINDOW", "30") or "30"
         )
         self._bot_rate_cooldown: float = float(
-            os.getenv("ZULIP_BOT_RATE_COOLDOWN", "60") or "60"
+            _env("ZULIP_BOT_RATE_COOLDOWN", "60") or "60"
         )
         self._bot_repeat_k: int = int(
-            os.getenv("ZULIP_BOT_REPEAT_K", "3") or "3"
+            _env("ZULIP_BOT_REPEAT_K", "3") or "3"
         )
         self._bot_repeat_trivial_len: int = int(
-            os.getenv("ZULIP_BOT_REPEAT_TRIVIAL_LEN", "5") or "5"
+            _env("ZULIP_BOT_REPEAT_TRIVIAL_LEN", "5") or "5"
         )
         self._bot_convo_state: Dict[tuple, dict] = {}
 
 
-        free_streams_raw = os.getenv("ZULIP_FREE_RESPONSE_STREAMS", "")
+        free_streams_raw = _env("ZULIP_FREE_RESPONSE_STREAMS", "")
         self._free_response_streams: set = {
             s.strip().lower()
             for s in free_streams_raw.split(",")
@@ -770,7 +797,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 0,
                 int(
                     config.extra.get("context_depth")
-                    or os.getenv("ZULIP_CONTEXT_DEPTH", "0")
+                    or _env("ZULIP_CONTEXT_DEPTH", "0")
                 ),
             )
         except (TypeError, ValueError):
@@ -793,7 +820,7 @@ class ZulipAdapter(BasePlatformAdapter):
         self._catchup_enabled: bool = (
             str(config.extra.get("catchup_enabled", "")).lower()
             in ("true", "1", "yes")
-            or os.getenv("ZULIP_CATCHUP", "false").lower()
+            or _env("ZULIP_CATCHUP", "false").lower()
             in ("true", "1", "yes")
         )
         # Per-stream cap on messages replayed per (re-)register — bounds the
@@ -803,7 +830,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 1,
                 int(
                     config.extra.get("catchup_max_messages")
-                    or os.getenv(
+                    or _env(
                         "ZULIP_CATCHUP_MAX_MESSAGES",
                         str(_CATCHUP_DEFAULT_MAX_MESSAGES),
                     )
@@ -2769,19 +2796,19 @@ def _zulip_configured(config: PlatformConfig) -> bool:
         and (
             getattr(config, "token", None)
             or getattr(config, "api_key", None)
-            or os.getenv("ZULIP_API_KEY", "").strip()
+            or _env("ZULIP_API_KEY", "").strip()
         )
     )
 
 
 def _env_enablement() -> Optional[dict]:
     """Seed PlatformConfig.extra/home_channel from ZULIP_* env vars."""
-    api_key = os.getenv("ZULIP_API_KEY", "").strip()
-    bot_email = os.getenv("ZULIP_BOT_EMAIL", "").strip()
-    site_url = os.getenv("ZULIP_SITE_URL", "").strip()
-    default_stream = os.getenv("ZULIP_DEFAULT_STREAM", "").strip()
-    home_topic = os.getenv("ZULIP_HOME_TOPIC", "").strip()
-    home_channel = os.getenv("ZULIP_HOME_CHANNEL", "").strip()
+    api_key = _env("ZULIP_API_KEY", "").strip()
+    bot_email = _env("ZULIP_BOT_EMAIL", "").strip()
+    site_url = _env("ZULIP_SITE_URL", "").strip()
+    default_stream = _env("ZULIP_DEFAULT_STREAM", "").strip()
+    home_topic = _env("ZULIP_HOME_TOPIC", "").strip()
+    home_channel = _env("ZULIP_HOME_CHANNEL", "").strip()
 
     if not any([api_key, bot_email, site_url, default_stream, home_topic, home_channel]):
         return None
@@ -2799,10 +2826,10 @@ def _env_enablement() -> Optional[dict]:
         seed["default_stream"] = default_stream
     if home_topic:
         seed["home_topic"] = home_topic
-    catchup = os.getenv("ZULIP_CATCHUP", "").strip()
+    catchup = _env("ZULIP_CATCHUP", "").strip()
     if catchup:
         seed["catchup_enabled"] = catchup
-    catchup_max = os.getenv("ZULIP_CATCHUP_MAX_MESSAGES", "").strip()
+    catchup_max = _env("ZULIP_CATCHUP_MAX_MESSAGES", "").strip()
     if catchup_max:
         seed["catchup_max_messages"] = catchup_max
 
@@ -2814,7 +2841,7 @@ def _env_enablement() -> Optional[dict]:
     if home_chat_id:
         seed["home_channel"] = {
             "chat_id": home_chat_id,
-            "name": os.getenv("ZULIP_HOME_CHANNEL_NAME", "Home"),
+            "name": _env("ZULIP_HOME_CHANNEL_NAME", "Home"),
         }
 
     return seed
@@ -2825,15 +2852,24 @@ def _apply_yaml_config(yaml_cfg: dict, zulip_cfg: dict) -> Optional[dict]:
 
     Env vars keep precedence. Returned values are merged into
     ``PlatformConfig.extra`` by the gateway config loader.
+
+    Under multiplex we never write into process-global ``os.environ`` — that
+    would leak one profile's credentials into another profile's adapter.
     """
     extra: dict[str, Any] = {}
+    multiplex = False
+    try:
+        from agent.secret_scope import is_multiplex_active
+        multiplex = bool(is_multiplex_active())
+    except Exception:
+        multiplex = False
 
     def _string_key(key: str, env_name: str) -> None:
         value = zulip_cfg.get(key)
         if value is None:
             return
         text = str(value).strip()
-        if text and not os.getenv(env_name):
+        if text and not _env(env_name) and not multiplex:
             os.environ[env_name] = text
         if text and key not in {"api_key", "token"}:
             extra[key] = text
