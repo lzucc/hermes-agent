@@ -46,10 +46,11 @@ Before setup, here's the part most people want to know: how Hermes behaves once 
 
 | Context | Behavior |
 |---------|----------|
-| **DMs** | Hermes responds to every message. No `@mention` needed. Each DM has its own session. |
+| **DMs (1:1 with a person)** | Hermes responds to every message. No `@mention` needed. Each DM has its own session. |
+| **DMs (bot ↔ bot)** | Opt-in only, in **private DMs** (1:1 or multi-party such as **2 bots + 1 human**). Peer bot messages must start with `:satellite_antenna:` (📡; configurable via `ZULIP_A2A_PREFIX`). Hermes strips the prefix before the agent runs. Replies to a 1:1 bot DM always get the prefix; in a group DM, replies keep it after an A2A inbound (until a human speaks again). Messages without the prefix are ignored — that is how a bot-to-bot exchange stops. Streams never accept bot-to-bot turns under the default policy. |
 | **Stream messages** | Hermes responds when you `@mention` it. Without a mention, Hermes ignores the message. |
 | **Topics** | Each stream+topic combination gets its own session. Changing the topic starts a fresh conversation. |
-| **Group DMs** | Hermes responds to every message in group DMs. Each group DM has its own session. |
+| **Group DMs (humans)** | Hermes responds to every **human** message. Peer **bot** messages need `:satellite_antenna:` (same bot-to-bot rule as 1:1). Each group DM has its own session. |
 | **Shared streams with multiple users** | By default, Hermes isolates session history per user inside the stream. Two people talking in the same stream do not share one transcript unless you explicitly disable that. |
 
 :::tip
@@ -173,6 +174,17 @@ ZULIP_DEFAULT_STREAM=general
 
 # Streams where @mention is not required (comma-separated names or IDs)
 # ZULIP_FREE_RESPONSE_STREAMS=bot-commands,42
+
+# Bot-to-bot (private DMs: 1:1 or group e.g. 2 bots + 1 human).
+# Peer bots must prefix messages with :satellite_antenna:; humans never need it.
+# ZULIP_BOT_POLICY=limited          # block | limited | allow (default: limited)
+# ZULIP_A2A_PREFIX=:satellite_antenna:  # required prefix for bot↔bot bodies
+# ZULIP_ALLOWED_BOT_SENDERS=orchestrator-bot@example.com  # bypass gate
+# ZULIP_BOT_RATE_MAX=5              # circuit breakers under policy=limited
+# ZULIP_BOT_RATE_WINDOW=30
+# ZULIP_BOT_RATE_COOLDOWN=60
+# ZULIP_BOT_REPEAT_K=3
+# ZULIP_BOT_REPEAT_TRIVIAL_LEN=5
 
 # Missed-message catch-up — back-fill messages that arrived while the gateway
 # was down (default: off). See "Missed-Message Catch-Up" below.

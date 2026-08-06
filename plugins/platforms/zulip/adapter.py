@@ -21,6 +21,14 @@ Environment variables:
     ZULIP_REQUIRE_MENTION    Require @mention in streams (default: "true")
     ZULIP_FREE_RESPONSE_STREAMS  Comma-separated stream names or IDs that
                              don't require @mention
+    ZULIP_BOT_POLICY         Bot-to-bot policy: block | limited | allow
+                             (default: limited). Bot↔bot is private DMs only
+                             (1:1 or group, e.g. 2 bots + 1 human) and
+                             requires the :satellite_antenna: message prefix.
+    ZULIP_ALLOWED_BOT_SENDERS  Comma-separated bot emails that bypass the
+                             bot-to-bot gate entirely
+    ZULIP_A2A_PREFIX         Prefix for bot-to-bot messages
+                             (default: :satellite_antenna:)
 """
 
 from __future__ import annotations
@@ -80,6 +88,21 @@ def _env(name: str, default: str = "") -> str:
 # Zulip message size limit — server default is 10000, but 4000 matches
 # the practical limit used by other adapters in this codebase.
 MAX_MESSAGE_LENGTH = 4000
+
+# Bot-to-bot (agent-to-agent) opt-in marker.  Peer bots only process private
+# DM messages (1:1 or multi-party, e.g. 2 bots + 1 human) that start with
+# this prefix.  Outbound replies to known bot 1:1 DMs, or group DMs after an
+# A2A inbound, get the same prefix so the peer can answer.  Drop the prefix
+# (or stay silent) to end the exchange.  Streams never participate in bot2bot
+# under the default policy.
+#
+# Default is the Zulip emoji shortcode ``:satellite_antenna:`` (📡).  Inbound
+# matching also accepts the rendered Unicode glyph so clients that store the
+# emoji form still pass the gate.
+DEFAULT_A2A_PREFIX = ":satellite_antenna:"
+# Inbound aliases accepted when checking/stripping the configured prefix
+# (only applied when the configured prefix is the default shortcode).
+_A2A_UNICODE_GLYPH = "\U0001f4e1"  # 📡 SATELLITE ANTENNA
 
 # Inbound pasted/attached files arrive in message content as markdown links
 # targeting the realm's /user_uploads/ endpoint:
@@ -361,6 +384,24 @@ def is_group_dm_chat_id(chat_id: str) -> bool:
     return chat_id.startswith(_GROUP_DM_PREFIX)
 
 
+def _user_id_from_dummy_api_email(email: str) -> Optional[int]:
+    """Extract the embedded user_id from a Zulip dummy API email.
+
+    When email visibility is restricted, Zulip exposes
+    ``user{user_id}@{realm_host}`` as the API email.  That form is stable
+    for typing resolution without a network round-trip.
+    """
+    if not email or "@" not in email:
+        return None
+    local, _sep, _domain = email.partition("@")
+    if not local.startswith("user"):
+        return None
+    suffix = local[4:]
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
 def _build_stream_typing_request(stream_id: int, topic: str, op: str) -> Dict[str, Any]:
     """Build Zulip's channel typing payload using the modern stream_id + topic shape.
 
@@ -424,6 +465,95 @@ def _resolve_stream_name(
             return name
 
     return str(stream_id)
+
+
+def _a2a_prefix_matchers(prefix: str) -> Tuple[str, ...]:
+    """Return leading tokens that count as an A2A prefix for *prefix*.
+
+    When *prefix* is the default Zulip shortcode, also accept the Unicode
+    satellite-antenna glyph (some clients / paste paths store the emoji).
+    """
+    if not prefix:
+        return ()
+    matchers = [prefix]
+    if prefix == DEFAULT_A2A_PREFIX and _A2A_UNICODE_GLYPH not in matchers:
+        matchers.append(_A2A_UNICODE_GLYPH)
+    return tuple(matchers)
+
+
+def _has_a2a_prefix(content: str, prefix: str = DEFAULT_A2A_PREFIX) -> bool:
+    """Return True if *content* starts with the bot-to-bot prefix."""
+    if not content or not prefix:
+        return False
+    stripped = content.lstrip()
+    return any(stripped.startswith(m) for m in _a2a_prefix_matchers(prefix))
+
+
+def _strip_a2a_prefix(content: str, prefix: str = DEFAULT_A2A_PREFIX) -> str:
+    """Remove a leading A2A prefix (and one following space) from *content*."""
+    if not content or not prefix:
+        return content
+    stripped = content.lstrip()
+    for matcher in _a2a_prefix_matchers(prefix):
+        if stripped.startswith(matcher):
+            rest = stripped[len(matcher):]
+            if rest.startswith(" "):
+                rest = rest[1:]
+            return rest
+    return content
+
+
+def _ensure_a2a_prefix(content: str, prefix: str = DEFAULT_A2A_PREFIX) -> str:
+    """Guarantee *content* starts with the A2A prefix (idempotent)."""
+    if not content:
+        return f"{prefix}"
+    if _has_a2a_prefix(content, prefix):
+        # Normalize to the configured prefix form + space + body.
+        body = _strip_a2a_prefix(content, prefix)
+        return f"{prefix} {body}" if body else prefix
+    body = content.strip()
+    return f"{prefix} {body}" if body else prefix
+
+
+def _is_private_message(message: Dict[str, Any]) -> bool:
+    """True when *message* is a Zulip private DM (1:1 or group)."""
+    return message.get("type") == "private"
+
+
+def _is_one_to_one_private_message(
+    message: Dict[str, Any],
+    bot_email: str,
+) -> bool:
+    """True when *message* is a 1:1 private DM (exactly one non-bot peer)."""
+    if not _is_private_message(message):
+        return False
+    sender_email = message.get("sender_email", "") or ""
+    recipients = _extract_dm_recipients(
+        message.get("display_recipient"),
+        bot_email,
+        sender_email,
+    )
+    return len(recipients) == 1
+
+
+def _private_chat_id_from_message(
+    message: Dict[str, Any],
+    bot_email: str,
+) -> Optional[str]:
+    """Build Hermes chat_id for a private message (1:1 or group DM)."""
+    if not _is_private_message(message):
+        return None
+    sender_email = message.get("sender_email", "") or ""
+    recipients = _extract_dm_recipients(
+        message.get("display_recipient"),
+        bot_email,
+        sender_email,
+    )
+    if not recipients:
+        return None
+    if len(recipients) == 1:
+        return _build_dm_chat_id(recipients[0])
+    return _build_group_dm_chat_id(recipients)
 
 
 def _strip_bot_mention(
@@ -559,13 +689,13 @@ class ZulipAdapter(BasePlatformAdapter):
         # Bot-to-bot conversation policy — three modes:
         #   block   → drop every inbound message from another realm bot
         #             (safe fallback / emergency loop-break)
-        #   limited → allow bot conversations but enforce circuit breakers
-        #             on rate and trivial-content repetition per
-        #             (sender, conversation) pair. This is the default:
-        #             two Hermes bots can genuinely talk, but a runaway
-        #             loop is auto-broken within seconds.  No cap on total
-        #             turns — long legitimate conversations are allowed.
-        #   allow   → no restrictions (dev/test only).
+        #   limited → bot↔bot only on **private DMs** (1:1 or multi-party,
+        #             e.g. 2 bots + 1 human), and only when the body starts
+        #             with the A2A prefix (default ``:satellite_antenna:``).
+        #             Rate and repetition circuit breakers still apply.
+        #             Streams never accept peer-bot messages.  Human
+        #             messages in any DM are unchanged (no prefix required).
+        #   allow   → no bot filtering (dev/test only).
         #
         # ZULIP_ALLOWED_BOT_SENDERS (comma-separated emails) always
         # bypasses the guard entirely — use for deliberate orchestrator
@@ -580,6 +710,13 @@ class ZulipAdapter(BasePlatformAdapter):
             for s in _env("ZULIP_ALLOWED_BOT_SENDERS", "").split(",")
             if s.strip()
         }
+        self._a2a_prefix: str = (
+            _env("ZULIP_A2A_PREFIX", DEFAULT_A2A_PREFIX).strip()
+            or DEFAULT_A2A_PREFIX
+        )
+        # chat_ids where the latest accepted inbound was A2A (group DM
+        # replies should keep the prefix so peer bots can continue).
+        self._a2a_reply_chats: set = set()
         # Circuit-breaker thresholds (policy=limited only).
         self._bot_rate_max: int = int(
             _env("ZULIP_BOT_RATE_MAX", "5") or "5"
@@ -690,6 +827,13 @@ class ZulipAdapter(BasePlatformAdapter):
         # (rare) case of an outbound DM typing indicator before any inbound
         # traffic from that user has been seen in the current process.
         self._user_id_cache: Dict[str, int] = {}
+        # Last successful typing *target* per gateway chat_id (op stripped).
+        # stop_typing reuses this so it does not need to re-resolve stream IDs
+        # or user IDs — critical when base._stop_typing_refresh / run.py call
+        # stop_typing(chat_id) without metadata, and after cache/client races
+        # that would otherwise leave the "is typing" indicator stuck until
+        # Zulip's server-side expiry.
+        self._active_typing_targets: Dict[str, Dict[str, Any]] = {}
         # Realm bot user_ids — populated by `_refresh_user_cache`, used by the
         # inbound bot-to-bot reflection guard (ZULIP_IGNORE_BOTS).
         self._bot_user_ids: set = set()
@@ -835,8 +979,10 @@ class ZulipAdapter(BasePlatformAdapter):
         self._stream_id_cache.clear()
         self._stream_name_cache.clear()
         self._user_id_cache.clear()
+        self._active_typing_targets.clear()
         self._bot_user_ids.clear()
         self._bot_convo_state.clear()
+        self._a2a_reply_chats.clear()
         self._consecutive_failures = 0
 
         self._mark_disconnected()
@@ -854,6 +1000,8 @@ class ZulipAdapter(BasePlatformAdapter):
             return SendResult(success=True)
 
         outbound_chat_id = self._metadata_adjusted_chat_id(chat_id, metadata)
+        # Bot-to-bot: 1:1 peer bot always; group DM after A2A inbound.
+        content = self._maybe_a2a_prefix_outbound(outbound_chat_id, content)
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, MAX_MESSAGE_LENGTH)
@@ -902,78 +1050,162 @@ class ZulipAdapter(BasePlatformAdapter):
         + ``topic`` (see :func:`_build_stream_typing_request`). For DMs it
         requires integer user IDs (never bare emails) in the ``to`` array.
         Both are resolved on-demand via caches + resolvers below.
+
+        On a successful start we remember the exact wire payload under
+        *chat_id* so :meth:`stop_typing` can clear the same conversation even
+        when the caller omits metadata or user/stream resolution later fails.
         """
         if not self._client:
             logger.debug("Zulip: send_typing called but no client yet for chat_id=%r", chat_id)
             return
 
-        outbound_chat_id = chat_id
-        thread_id = metadata.get("thread_id") if metadata else None
-        if thread_id and not _parse_stream_chat_id(chat_id):
-            if not is_dm_chat_id(chat_id) and not is_group_dm_chat_id(chat_id):
-                outbound_chat_id = f"{chat_id}:{thread_id}"
-
+        outbound_chat_id = self._metadata_adjusted_chat_id(chat_id, metadata)
         request = self._build_typing_request(outbound_chat_id, op="start")
         if not request:
-            logger.warning("Zulip: send_typing failed — could not resolve chat_id %r (no request built)", outbound_chat_id)
+            logger.warning(
+                "Zulip: send_typing failed — could not resolve chat_id %r (no request built)",
+                outbound_chat_id,
+            )
             return
+
+        # Remember the target *before* the network call so a cancel/timeout
+        # after the server accepted "start" still leaves stop with a payload.
+        self._remember_typing_target(chat_id, request, outbound_chat_id)
 
         # Success-path logging is debug only; INFO would spam gateway.log on
         # every assistant turn because _keep_typing refreshes every ~2s.
-        logger.debug("Zulip: sending typing indicator → chat_id=%r payload=%s", outbound_chat_id, request)
+        logger.debug(
+            "Zulip: sending typing indicator → chat_id=%r payload=%s",
+            outbound_chat_id,
+            request,
+        )
 
         try:
             send_client = self._build_send_client()
             result = await asyncio.to_thread(send_client.set_typing_status, request)
             if result.get("result") != "success":
-                logger.debug("Zulip: send_typing API call failed — %s (payload was %s)", result.get("msg", "unknown error"), request)
+                logger.debug(
+                    "Zulip: send_typing API call failed — %s (payload was %s)",
+                    result.get("msg", "unknown error"),
+                    request,
+                )
+                # Failed start: drop the sticky target so stop does not fire a
+                # no-op stop for a conversation that never showed typing.
+                self._forget_typing_target(chat_id, outbound_chat_id)
             else:
-                logger.debug("Zulip: send_typing SUCCESS for %r (payload=%s)", chat_id, request)
+                logger.debug(
+                    "Zulip: send_typing SUCCESS for %r (payload=%s)",
+                    chat_id,
+                    request,
+                )
+        except asyncio.CancelledError:
+            # Cancelled mid-flight (base typing refresh timeout/cancel). Keep
+            # the sticky target — the server may have already accepted start.
+            raise
         except Exception as exc:
-            logger.debug("Zulip: send_typing exception — %s (payload was %s)", exc, request)
+            logger.debug(
+                "Zulip: send_typing exception — %s (payload was %s)",
+                exc,
+                request,
+            )
+            self._forget_typing_target(chat_id, outbound_chat_id)
 
     async def stop_typing(
         self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
     ) -> None:
         """Clear the typing indicator in Zulip (send 'op': 'stop').
 
-        Thread metadata is applied with the same outbound_chat_id adjustment as
-        send_typing. That matters when the gateway source is a named stream
-        (``general``) and the actual Zulip topic lives in metadata
-        (``thread_id``): the stop request must resolve to the same numeric
-        ``stream_id`` + topic payload as the start request.
+        Preference order for the stop payload:
+        1. Sticky target remembered from the last successful ``send_typing``
+           for this *chat_id* (works even when callers omit metadata — the
+           common path from ``BasePlatformAdapter._stop_typing_refresh`` and
+           ``gateway/run.py``).
+        2. Fresh resolve from *chat_id* + optional thread metadata (same
+           adjustment as :meth:`send_typing`).
+
+        Thread metadata still matters for path (2) when the gateway source is
+        a named stream (``general``) and the topic lives in
+        ``metadata['thread_id']``.
         """
         if not self._client:
             logger.debug("Zulip: stop_typing called but no client yet for chat_id=%r", chat_id)
             return
 
-        outbound_chat_id = chat_id
-        thread_id = metadata.get("thread_id") if metadata else None
-        if thread_id and not _parse_stream_chat_id(chat_id):
-            if not is_dm_chat_id(chat_id) and not is_group_dm_chat_id(chat_id):
-                outbound_chat_id = f"{chat_id}:{thread_id}"
-
-        request = self._build_typing_request(outbound_chat_id, op="stop")
+        outbound_chat_id = self._metadata_adjusted_chat_id(chat_id, metadata)
+        request = self._typing_stop_request(chat_id, outbound_chat_id)
         if not request:
             logger.warning(
                 "Zulip: stop_typing failed — could not resolve chat_id %r (no request built)",
                 outbound_chat_id,
             )
+            self._forget_typing_target(chat_id, outbound_chat_id)
             return
 
         # Debug level only — stop is called on every turn completion and must
         # not pollute INFO logs.
-        logger.debug("Zulip: sending STOP typing → chat_id=%r payload=%s", outbound_chat_id, request)
+        logger.debug(
+            "Zulip: sending STOP typing → chat_id=%r payload=%s",
+            outbound_chat_id,
+            request,
+        )
 
         try:
             send_client = self._build_send_client()
             result = await asyncio.to_thread(send_client.set_typing_status, request)
             if result.get("result") != "success":
-                logger.debug("Zulip: stop_typing failed — %s (payload=%s)", result.get("msg", "unknown error"), request)
+                logger.debug(
+                    "Zulip: stop_typing failed — %s (payload=%s)",
+                    result.get("msg", "unknown error"),
+                    request,
+                )
             else:
                 logger.debug("Zulip: stop_typing SUCCESS for %r", outbound_chat_id)
         except Exception as exc:
-            logger.debug("Zulip: stop_typing exception — %s (payload=%s)", exc, request)
+            logger.debug(
+                "Zulip: stop_typing exception — %s (payload=%s)",
+                exc,
+                request,
+            )
+        finally:
+            # Always drop the sticky target after an attempt so a later turn
+            # rebuilds from live resolution rather than a stale payload.
+            self._forget_typing_target(chat_id, outbound_chat_id)
+
+    def _remember_typing_target(
+        self,
+        chat_id: str,
+        request: Dict[str, Any],
+        outbound_chat_id: Optional[str] = None,
+    ) -> None:
+        """Store the wire payload for a live typing indicator (op stripped)."""
+        target = {k: v for k, v in request.items() if k != "op"}
+        self._active_typing_targets[chat_id] = target
+        if outbound_chat_id and outbound_chat_id != chat_id:
+            self._active_typing_targets[outbound_chat_id] = target
+
+    def _forget_typing_target(
+        self,
+        chat_id: str,
+        outbound_chat_id: Optional[str] = None,
+    ) -> None:
+        """Drop sticky typing targets for *chat_id* (and adjusted form)."""
+        self._active_typing_targets.pop(chat_id, None)
+        if outbound_chat_id and outbound_chat_id != chat_id:
+            self._active_typing_targets.pop(outbound_chat_id, None)
+
+    def _typing_stop_request(
+        self,
+        chat_id: str,
+        outbound_chat_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Build a stop payload, preferring the sticky start target."""
+        for key in (chat_id, outbound_chat_id):
+            target = self._active_typing_targets.get(key)
+            if target:
+                stop = dict(target)
+                stop["op"] = "stop"
+                return stop
+        return self._build_typing_request(outbound_chat_id, op="stop")
 
     async def _keep_typing(
         self,
@@ -982,7 +1214,12 @@ class ZulipAdapter(BasePlatformAdapter):
         metadata=None,
         stop_event: Optional[asyncio.Event] = None,
     ) -> None:
-        """Preserve Zulip topic metadata when the typing refresher stops."""
+        """Preserve Zulip topic metadata when the typing refresher stops.
+
+        Base ``_keep_typing`` finally calls ``stop_typing(chat_id)`` with no
+        metadata. Sticky targets cover that path; re-stopping with metadata
+        here is belt-and-suspenders for named-stream + topic routing.
+        """
         try:
             await super()._keep_typing(
                 chat_id,
@@ -991,11 +1228,10 @@ class ZulipAdapter(BasePlatformAdapter):
                 stop_event=stop_event,
             )
         finally:
-            if metadata:
-                try:
-                    await self.stop_typing(chat_id, metadata=metadata)
-                except Exception:
-                    pass
+            try:
+                await self.stop_typing(chat_id, metadata=metadata)
+            except Exception:
+                pass
 
     def warn_streaming_edits_enabled(self) -> None:
         """Warn once before Zulip edit-based streaming mutates a message."""
@@ -1607,8 +1843,9 @@ class ZulipAdapter(BasePlatformAdapter):
           The legacy ``{"to": [stream_name]}`` form is no longer reliable
           (community patch + on-demand resolver fixed this).
         * DMs (1:1 or group): MUST use ``{"to": [integer_user_id, ...], "type": "direct"}``.
-          Emails (even as strings) are rejected by the server. See the long
-          comment on ``_user_id_cache`` and the population site in
+          Emails (even as strings) are rejected by the server (email support
+          was removed in Zulip 3.0 / feature level 11). See the long comment
+          on ``_user_id_cache`` and the population site in
           ``_dispatch_inbound``.
         On-demand resolvers + caches make this work even on first message to
         a stream/user in the process lifetime.
@@ -1628,47 +1865,112 @@ class ZulipAdapter(BasePlatformAdapter):
             if stream_id is not None:
                 return _build_stream_typing_request(stream_id, topic, op)
 
-            # Only as a last-ditch fallback (should rarely happen now)
-            logger.debug("Zulip: falling back to legacy stream name for typing of %r", chat_id)
+            # Only as a last-ditch fallback (should rarely happen now).
+            # Pre-Zulip-8 servers accepted stream typing via ``to``; modern
+            # servers require stream_id and will reject this shape.
+            logger.debug(
+                "Zulip: falling back to legacy stream name for typing of %r",
+                chat_id,
+            )
             return {"to": [stream_name], "type": "stream", "op": op}
 
         dm_email = _parse_dm_chat_id(chat_id)
         if dm_email:
-            key = dm_email.lower()
-            user_id = self._user_id_cache.get(key)
-            if user_id is None:
-                user_id = self._resolve_user_id(dm_email)
+            user_id = self._lookup_user_id(dm_email)
             if user_id is not None:
                 return {"to": [user_id], "type": "direct", "op": op}
-            logger.warning("Zulip: could not resolve DM email %r to user ID for typing (no cache hit, resolution failed)", dm_email)
-            # Do not fall back to email — Zulip rejects non-integer user IDs for direct typing
+            logger.warning(
+                "Zulip: could not resolve DM email %r to user ID for typing "
+                "(no cache hit, resolution failed)",
+                dm_email,
+            )
+            # Do not fall back to email — Zulip rejects non-integer user IDs
+            # for direct typing (removed in feature level 11).
             return None
+
+        group_emails = _parse_group_dm_chat_id(chat_id)
+        if group_emails:
+            user_ids: List[int] = []
+            for email in group_emails:
+                uid = self._lookup_user_id(email)
+                if uid is None:
+                    logger.warning(
+                        "Zulip: could not resolve group-DM email %r to user ID "
+                        "for typing",
+                        email,
+                    )
+                    return None
+                user_ids.append(uid)
+            if user_ids:
+                return {"to": user_ids, "type": "direct", "op": op}
+            return None
+
         return None
 
+    def _lookup_user_id(self, email: str) -> Optional[int]:
+        """Resolve *email* → user_id via cache, then on-demand lookup."""
+        if not email:
+            return None
+        key = email.lower()
+        cached = self._user_id_cache.get(key)
+        if cached is not None:
+            return cached
+        # Dummy Zulip API emails embed the id: user{id}@{realm_host}.
+        # Resolve without a network call when the chat_id uses that form.
+        dummy_uid = _user_id_from_dummy_api_email(email)
+        if dummy_uid is not None:
+            self._user_id_cache[key] = dummy_uid
+            return dummy_uid
+        return self._resolve_user_id(email)
+
     def _resolve_stream_id(self, stream_name: str) -> Optional[int]:
-        """Best-effort live lookup of stream name → ID using the Zulip client.
+        """Best-effort live lookup of stream name → ID.
+
+        Uses a short-lived send client (not the long-poll event client) so
+        resolution never races the event-queue thread's SSL session.
 
         Populates both caches on success. Used by the typing path so we don't
         depend on the background stream list having run yet (e.g. first typing
         indicator before any messages arrived in a stream).
-
-        Follows the same cache + on-demand pattern as the user_id resolver
-        for DM typing.
         """
         if not self._client or not stream_name:
             return None
         key = stream_name.lower()
         try:
-            result = self._client.get_streams()
-            for s in result.get("streams", []):
+            client = self._build_send_client()
+            # Prefer the dedicated helper when available (single stream lookup).
+            get_stream_id = getattr(client, "get_stream_id", None)
+            if callable(get_stream_id):
+                result = get_stream_id(stream_name)
+                if result.get("result") == "success":
+                    sid = result.get("stream_id")
+                    if sid is not None:
+                        self._stream_id_cache[key] = int(sid)
+                        self._stream_name_cache[int(sid)] = stream_name
+                        logger.debug(
+                            "Zulip: on-demand resolved stream %r -> id=%s for typing",
+                            stream_name,
+                            sid,
+                        )
+                        return int(sid)
+            result = client.get_streams()
+            for s in result.get("streams", []) if isinstance(result, dict) else []:
                 if s.get("name", "").lower() == key:
                     sid = s["stream_id"]
                     self._stream_id_cache[key] = sid
                     self._stream_name_cache[sid] = s["name"]
-                    logger.debug("Zulip: on-demand resolved stream %r -> id=%s for typing", stream_name, sid)
+                    logger.debug(
+                        "Zulip: on-demand resolved stream %r -> id=%s for typing",
+                        stream_name,
+                        sid,
+                    )
                     return sid
         except Exception as exc:
-            logger.warning("Zulip: on-demand stream resolution failed for %r: %s", stream_name, exc)
+            logger.warning(
+                "Zulip: on-demand stream resolution failed for %r: %s",
+                stream_name,
+                exc,
+            )
         return None
 
     def _resolve_user_id(self, email: str) -> Optional[int]:
@@ -1678,19 +1980,35 @@ class ZulipAdapter(BasePlatformAdapter):
         integer user IDs in the "to" field — emails are rejected at the API
         level (this was the root cause of DM typing being completely silent).
 
-        We primarily populate the cache from inbound "sender_id" in
-        _dispatch_inbound (Zulip always sends numeric IDs in message events).
-        This on-demand path (GET /users/{email} via call_endpoint) is the
-        fallback for the first outbound
-        typing indicator to a user we have never received a message from yet.
+        Resolution order:
+        1. In-memory ``_user_id_cache`` (inbound events + connect pre-warm)
+        2. GET ``/users/{email}`` on a fresh send client
+        3. Full ``get_users()`` scan (email + delivery_email) as a fallback
+           when the by-email endpoint fails (privacy, older servers, etc.)
+
+        Uses a short-lived send client rather than the long-poll event client
+        so concurrent typing resolution never corrupts the event queue's SSL
+        session (the same reason :meth:`_build_send_client` exists for sends).
         """
         if not email or not self._client:
             return None
         key = email.lower()
         if key in self._user_id_cache:
             return self._user_id_cache[key]
+
         try:
-            result = self._client.call_endpoint(
+            client = self._build_send_client()
+        except Exception as exc:
+            logger.warning(
+                "Zulip: cannot build client for user resolution of %r: %s",
+                email,
+                exc,
+            )
+            return None
+
+        # 1) Direct by-email endpoint (Zulip ≥ 4.0 / feature level 39).
+        try:
+            result = client.call_endpoint(
                 url=f"users/{email}",
                 method="GET",
             )
@@ -1698,12 +2016,68 @@ class ZulipAdapter(BasePlatformAdapter):
                 user = result.get("user") or {}
                 uid = user.get("user_id")
                 if uid:
-                    self._user_id_cache[key] = uid
-                    logger.debug("Zulip: on-demand resolved user %r -> id=%s for typing", email, uid)
-                    return uid
+                    uid_int = int(uid)
+                    # Always index the email we looked up — the API user
+                    # object may omit email/delivery_email under privacy
+                    # settings, but the lookup key is still valid for typing.
+                    self._user_id_cache[key] = uid_int
+                    self._cache_user_emails(user, uid_int)
+                    logger.debug(
+                        "Zulip: on-demand resolved user %r -> id=%s for typing",
+                        email,
+                        uid_int,
+                    )
+                    return uid_int
+            else:
+                logger.debug(
+                    "Zulip: GET users/%s failed — %s; trying get_users scan",
+                    email,
+                    result.get("msg", "unknown error"),
+                )
         except Exception as exc:
-            logger.warning("Zulip: on-demand user resolution failed for %r: %s", email, exc)
+            logger.debug(
+                "Zulip: GET users/%s raised %s; trying get_users scan",
+                email,
+                exc,
+            )
+
+        # 2) Full member list scan — also refreshes the typing cache.
+        try:
+            result = client.get_users()
+            if result.get("result") != "success":
+                return None
+            matched: Optional[int] = None
+            for user in result.get("members", []):
+                uid = user.get("user_id")
+                if not uid:
+                    continue
+                self._cache_user_emails(user, int(uid))
+                for email_key in (
+                    user.get("email"),
+                    user.get("delivery_email"),
+                ):
+                    if email_key and email_key.lower() == key:
+                        matched = int(uid)
+            if matched is not None:
+                logger.debug(
+                    "Zulip: resolved user %r -> id=%s via get_users scan",
+                    email,
+                    matched,
+                )
+                return matched
+        except Exception as exc:
+            logger.warning(
+                "Zulip: on-demand user resolution failed for %r: %s",
+                email,
+                exc,
+            )
         return None
+
+    def _cache_user_emails(self, user: Dict[str, Any], uid: int) -> None:
+        """Index *user*'s email fields into ``_user_id_cache``."""
+        for email_key in (user.get("email"), user.get("delivery_email")):
+            if email_key and "@" in str(email_key):
+                self._user_id_cache[str(email_key).lower()] = uid
 
     # ------------------------------------------------------------------
     # Internal: event queue
@@ -1998,27 +2372,10 @@ class ZulipAdapter(BasePlatformAdapter):
         if sender_email == self._bot_email or sender_id == self._bot_user_id:
             return
 
-        # Bot-to-bot conversation guard.  Zulip messages do NOT expose
-        # `sender_is_bot`, so we consult the bot user_id cache populated by
-        # `_refresh_user_cache`.  Behaviour is driven by ZULIP_BOT_POLICY:
-        #   block   → drop unconditionally
-        #   limited → allow, but enforce rate / repetition / total-turns
-        #             circuit breakers per conversation (default)
-        #   allow   → no filtering
-        # Emails in ZULIP_ALLOWED_BOT_SENDERS bypass the guard entirely.
-        if sender_id in self._bot_user_ids and self._bot_policy != "allow":
-            if sender_email.strip().lower() not in self._allowed_bot_senders:
-                if self._bot_policy == "block":
-                    logger.info(
-                        "Zulip: dropping bot message sender=%s "
-                        "(policy=block)",
-                        sender_email,
-                    )
-                    return
-                # policy=limited → run circuit breakers.
-                if not self._bot_conversation_allowed(message):
-                    return
-
+        # Bot-to-bot guard (1:1 DM + A2A prefix under policy=limited).
+        # May strip the A2A prefix from message["content"] in place.
+        if not self._accept_bot_inbound(message):
+            return
 
         # Schedule async processing on the main event loop.
         msg_type_log = message.get("type", "unknown")
@@ -2277,6 +2634,21 @@ class ZulipAdapter(BasePlatformAdapter):
             # declaration and _resolve_user_id for the full rationale).
             if sender_id > 0 and sender_email:
                 self._user_id_cache[sender_email.lower()] = sender_id
+            # Group DMs: cache every participant id present on the event so
+            # typing "to": [id, id, ...] can resolve without a network call.
+            if isinstance(display_recipient, list):
+                for entry in display_recipient:
+                    if not isinstance(entry, dict):
+                        continue
+                    entry_email = entry.get("email") or ""
+                    entry_id = entry.get("id") or entry.get("user_id")
+                    if entry_email and entry_id and entry_email.lower() != (
+                        self._bot_email or ""
+                    ).lower():
+                        try:
+                            self._user_id_cache[entry_email.lower()] = int(entry_id)
+                        except (TypeError, ValueError):
+                            pass
         else:
             logger.debug("Zulip: ignoring message of type '%s'", msg_type_name)
             return
@@ -2350,6 +2722,117 @@ class ZulipAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("Zulip: failed to fetch streams — %s", exc)
 
+    def _accept_bot_inbound(self, message: dict) -> bool:
+        """Apply bot-to-bot policy; return True if *message* should be processed.
+
+        Supported bot↔bot surface (policy=limited):
+          * **private DMs only** — 1:1 **or** multi-party (e.g. 2 bots + 1 human)
+          * body must start with the configured A2A prefix
+            (default ``:satellite_antenna:``)
+          * prefix is stripped in place so the agent sees the payload only
+          * rate / repetition circuit breakers still apply on the stripped body
+          * chat is marked for A2A outbound so replies keep the prefix
+
+        Humans are never filtered here (no prefix required).  Streams drop
+        peer-bot messages under limited/block.
+        ``ZULIP_ALLOWED_BOT_SENDERS`` bypasses every check.
+        """
+        sender_id = message.get("sender_id", -1)
+        sender_email = (message.get("sender_email") or "").strip()
+        sender_email_l = sender_email.lower()
+
+        # Not a known realm bot → human (or uncached user); allow.
+        # Human traffic clears A2A-reply marking so later human-triggered
+        # replies in a group DM are not auto-prefixed.
+        if sender_id not in self._bot_user_ids:
+            chat_id = _private_chat_id_from_message(message, self._bot_email)
+            if chat_id:
+                self._a2a_reply_chats.discard(chat_id)
+            return True
+
+        if self._bot_policy == "allow":
+            return True
+
+        if sender_email_l and sender_email_l in self._allowed_bot_senders:
+            return True
+
+        if self._bot_policy == "block":
+            logger.info(
+                "Zulip: dropping bot message sender=%s (policy=block)",
+                sender_email or sender_id,
+            )
+            return False
+
+        # policy=limited: private DM (1:1 or group) + A2A prefix only.
+        if not _is_private_message(message):
+            logger.info(
+                "Zulip: dropping bot message sender=%s — bot-to-bot only "
+                "supported in private DMs (got type=%s)",
+                sender_email or sender_id,
+                message.get("type", "?"),
+            )
+            return False
+
+        content = message.get("content") or ""
+        if not _has_a2a_prefix(content, self._a2a_prefix):
+            logger.info(
+                "Zulip: dropping bot message sender=%s — missing %s prefix "
+                "(bot-to-bot opt-in required in private DMs)",
+                sender_email or sender_id,
+                self._a2a_prefix,
+            )
+            return False
+
+        # Strip prefix before the agent; breakers see the payload only.
+        message["content"] = _strip_a2a_prefix(content, self._a2a_prefix)
+        if not (message.get("content") or "").strip():
+            logger.debug(
+                "Zulip: dropping empty bot A2A message sender=%s",
+                sender_email or sender_id,
+            )
+            return False
+
+        if not self._bot_conversation_allowed(message):
+            return False
+
+        chat_id = _private_chat_id_from_message(message, self._bot_email)
+        if chat_id:
+            self._a2a_reply_chats.add(chat_id)
+        return True
+
+    def _peer_is_bot_dm(self, chat_id: str) -> bool:
+        """True when *chat_id* is a 1:1 DM whose peer is a known realm bot."""
+        if is_group_dm_chat_id(chat_id):
+            return False
+        dm_email = _parse_dm_chat_id(chat_id)
+        if not dm_email:
+            return False
+        key = dm_email.lower()
+        uid = self._user_id_cache.get(key)
+        if uid is not None and uid in self._bot_user_ids:
+            return True
+        # Allowlist / email match without id (connect cache miss).
+        if key in self._allowed_bot_senders:
+            return True
+        return False
+
+    def _maybe_a2a_prefix_outbound(self, chat_id: str, content: str) -> str:
+        """Prefix outbound bodies that continue a bot-to-bot exchange.
+
+        * 1:1 DM to a known peer bot → always prefix
+        * group DM marked after A2A inbound → prefix (2 bots + human room)
+        * human 1:1 / human-triggered group replies → no prefix
+        """
+        if not content:
+            return content
+        need_prefix = (
+            self._peer_is_bot_dm(chat_id)
+            or chat_id in self._a2a_reply_chats
+        )
+        if not need_prefix:
+            return content
+        return _ensure_a2a_prefix(content, self._a2a_prefix)
+
     def _bot_conversation_allowed(self, message: dict) -> bool:
         """Circuit breakers for bot-to-bot conversations (policy=limited).
 
@@ -2365,30 +2848,19 @@ class ZulipAdapter(BasePlatformAdapter):
             the signature of a degenerate "." / "(silent)" ping-pong.
             Sticky until process restart.
 
-        There is no total-turns cap: long legitimate conversations pass
-        through freely.  Hard breaks stay set to prevent the loop from
-        resuming the moment the cooldown expires — a genuinely stuck peer
-        will not self-heal.  Operator can clear by restarting the gateway.
+        Called only after the A2A prefix gate has accepted a private bot DM.
+        Hard breaks stay set until gateway restart.
         """
         from collections import deque
         now = time.time()
         sender_id = message.get("sender_id", -1)
 
-        # Conversation key: DMs use the recipient_id (which is the Zulip
-        # conversation id for that DM/group-DM); streams use stream+topic.
-        if message.get("type") == "stream":
-            convo_key = (
-                sender_id,
-                "stream",
-                message.get("stream_id") or message.get("display_recipient"),
-                message.get("subject", ""),
-            )
-        else:
-            convo_key = (
-                sender_id,
-                "dm",
-                message.get("recipient_id", 0),
-            )
+        # Private bot DMs (1:1 or group) key by sender + Zulip recipient_id.
+        convo_key = (
+            sender_id,
+            "dm",
+            message.get("recipient_id", 0),
+        )
 
         state = self._bot_convo_state.get(convo_key)
         if state is None:
@@ -2462,34 +2934,32 @@ class ZulipAdapter(BasePlatformAdapter):
 
     def _refresh_user_cache(self) -> None:
         """Fetch organization users and cache email → user_id for DM typing,
-        plus the set of user_ids that are bots (for reflection-loop guard)."""
+        plus the set of user_ids that are bots (for reflection-loop guard).
+
+        Called from :meth:`connect` *before* the event-queue thread starts, so
+        using ``self._client`` is safe here (no SSL race). On-demand typing
+        resolution later uses a send client via :meth:`_resolve_user_id`.
+        """
         if not self._client:
             return
         try:
             result = self._client.get_users()
             if result.get("result") != "success":
                 return
-            count = 0
             bot_ids: set = set()
             for user in result.get("members", []):
                 uid = user.get("user_id")
                 if not uid:
                     continue
                 if user.get("is_bot"):
-                    bot_ids.add(uid)
-                for email_key in (
-                    user.get("email"),
-                    user.get("delivery_email"),
-                ):
-                    if email_key and "@" in email_key:
-                        self._user_id_cache[email_key.lower()] = uid
-                        count += 1
+                    bot_ids.add(int(uid))
+                self._cache_user_emails(user, int(uid))
             self._bot_user_ids = bot_ids
-            if count:
+            if self._user_id_cache or bot_ids:
                 logger.info(
                     "Zulip: cached %d user email(s) for typing "
                     "(%d bot(s))",
-                    count,
+                    len(self._user_id_cache),
                     len(bot_ids),
                 )
         except Exception as exc:

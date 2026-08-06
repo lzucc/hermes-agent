@@ -349,6 +349,14 @@ class TestZulipDmChatId:
         from plugins.platforms.zulip.adapter import _parse_dm_chat_id
         assert _parse_dm_chat_id("dm:dm:alice@example.com") == "alice@example.com"
 
+    def test_user_id_from_dummy_api_email(self):
+        from plugins.platforms.zulip.adapter import _user_id_from_dummy_api_email
+        assert _user_id_from_dummy_api_email("user42@chat.example.com") == 42
+        assert _user_id_from_dummy_api_email("user0@zulip.local") == 0
+        assert _user_id_from_dummy_api_email("alice@example.com") is None
+        assert _user_id_from_dummy_api_email("userabc@example.com") is None
+        assert _user_id_from_dummy_api_email("") is None
+
     def test_parse_dm_chat_id_roundtrip(self):
         from plugins.platforms.zulip.adapter import _build_dm_chat_id, _parse_dm_chat_id
         original = _build_dm_chat_id("bob@example.org")
@@ -948,6 +956,245 @@ class TestZulipSelfMessageFiltering:
         # Not called because _loop is None, but NOT because of filtering
         # (we verify the filter didn't reject it by checking _seen_events)
         assert "102" in self.adapter._seen_events
+
+
+# ---------------------------------------------------------------------------
+# Bot-to-bot A2A (private DM + :satellite_antenna: prefix)
+# ---------------------------------------------------------------------------
+
+
+class TestZulipA2AHelpers:
+    def test_has_and_strip_a2a_prefix(self):
+        from plugins.platforms.zulip.adapter import (
+            DEFAULT_A2A_PREFIX,
+            _ensure_a2a_prefix,
+            _has_a2a_prefix,
+            _strip_a2a_prefix,
+        )
+
+        assert DEFAULT_A2A_PREFIX == ":satellite_antenna:"
+        assert _has_a2a_prefix(":satellite_antenna: hello") is True
+        assert _has_a2a_prefix("  :satellite_antenna: hello") is True
+        assert _has_a2a_prefix("hello :satellite_antenna:") is False
+        # Unicode glyph accepted as inbound alias for the default shortcode.
+        assert _has_a2a_prefix("📡 hello") is True
+        assert _strip_a2a_prefix(":satellite_antenna: hello") == "hello"
+        assert _strip_a2a_prefix("  :satellite_antenna:  hi") == " hi"
+        assert _strip_a2a_prefix("📡 payload") == "payload"
+        assert _ensure_a2a_prefix("hello") == ":satellite_antenna: hello"
+        assert (
+            _ensure_a2a_prefix(":satellite_antenna: hello")
+            == ":satellite_antenna: hello"
+        )
+        # Normalize unicode form back to the configured shortcode outbound.
+        assert _ensure_a2a_prefix("📡 hello") == ":satellite_antenna: hello"
+
+    def test_is_one_to_one_private_message(self):
+        from plugins.platforms.zulip.adapter import _is_one_to_one_private_message
+
+        one_to_one = {
+            "type": "private",
+            "sender_email": "peer-bot@example.com",
+            "display_recipient": [
+                {"email": "hermes-bot@example.zulipchat.com"},
+                {"email": "peer-bot@example.com"},
+            ],
+        }
+        group = {
+            "type": "private",
+            "sender_email": "peer-bot@example.com",
+            "display_recipient": [
+                {"email": "hermes-bot@example.zulipchat.com"},
+                {"email": "peer-bot@example.com"},
+                {"email": "human@example.com"},
+            ],
+        }
+        stream = {"type": "stream", "sender_email": "peer-bot@example.com"}
+        assert _is_one_to_one_private_message(
+            one_to_one, "hermes-bot@example.zulipchat.com"
+        )
+        assert not _is_one_to_one_private_message(
+            group, "hermes-bot@example.zulipchat.com"
+        )
+        assert not _is_one_to_one_private_message(
+            stream, "hermes-bot@example.zulipchat.com"
+        )
+
+
+class TestZulipBotToBotA2A:
+    def setup_method(self):
+        self.adapter = _make_adapter(bot_email="hermes-bot@example.zulipchat.com")
+        self.adapter._bot_user_id = 1
+        self.adapter._bot_full_name = "Hermes"
+        self.adapter._bot_policy = "limited"
+        self.adapter._a2a_prefix = ":satellite_antenna:"
+        self.adapter._bot_user_ids = {99}  # peer bot
+        self.adapter._loop = None
+
+    def _bot_dm(self, content: str, *, group: bool = False) -> dict:
+        recipients = [
+            {"email": "hermes-bot@example.zulipchat.com", "id": 1},
+            {"email": "peer-bot@example.com", "id": 99},
+        ]
+        if group:
+            recipients.append({"email": "human@example.com", "id": 7})
+        return {
+            "id": 500 + len(content),
+            "sender_email": "peer-bot@example.com",
+            "sender_id": 99,
+            "type": "private",
+            "content": content,
+            "recipient_id": 42,
+            "display_recipient": recipients,
+        }
+
+    def test_human_one_to_one_passes_without_a2a(self):
+        msg = {
+            "id": 601,
+            "sender_email": "alice@example.com",
+            "sender_id": 10,
+            "type": "private",
+            "content": "hello",
+            "display_recipient": [
+                {"email": "hermes-bot@example.zulipchat.com"},
+                {"email": "alice@example.com"},
+            ],
+        }
+        assert self.adapter._accept_bot_inbound(msg) is True
+        assert msg["content"] == "hello"
+
+    def test_bot_one_to_one_without_prefix_dropped(self):
+        msg = self._bot_dm("please help")
+        assert self.adapter._accept_bot_inbound(msg) is False
+
+    def test_bot_one_to_one_with_prefix_accepted_and_stripped(self):
+        msg = self._bot_dm(":satellite_antenna: please help")
+        assert self.adapter._accept_bot_inbound(msg) is True
+        assert msg["content"] == "please help"
+
+    def test_bot_one_to_one_unicode_glyph_accepted(self):
+        msg = self._bot_dm("📡 please help")
+        assert self.adapter._accept_bot_inbound(msg) is True
+        assert msg["content"] == "please help"
+
+    def test_bot_group_dm_with_prefix_accepted(self):
+        """2 bots + 1 human group DM: peer bot with A2A prefix is processed."""
+        msg = self._bot_dm(":satellite_antenna: hi all", group=True)
+        assert self.adapter._accept_bot_inbound(msg) is True
+        assert msg["content"] == "hi all"
+        # Group chat marked so outbound replies keep the A2A prefix.
+        assert any(
+            cid.startswith("group_dm:") for cid in self.adapter._a2a_reply_chats
+        )
+
+    def test_bot_group_dm_without_prefix_dropped(self):
+        msg = self._bot_dm("plain bot chatter", group=True)
+        assert self.adapter._accept_bot_inbound(msg) is False
+
+    def test_human_in_group_dm_clears_a2a_reply_mark(self):
+        """After a human speaks, group replies are not auto-prefixed as A2A."""
+        bot_msg = self._bot_dm(":satellite_antenna: handoff", group=True)
+        assert self.adapter._accept_bot_inbound(bot_msg) is True
+        assert self.adapter._a2a_reply_chats
+
+        human_msg = {
+            "id": 777,
+            "sender_email": "human@example.com",
+            "sender_id": 7,
+            "type": "private",
+            "content": "thanks both",
+            "display_recipient": [
+                {"email": "hermes-bot@example.zulipchat.com", "id": 1},
+                {"email": "peer-bot@example.com", "id": 99},
+                {"email": "human@example.com", "id": 7},
+            ],
+        }
+        assert self.adapter._accept_bot_inbound(human_msg) is True
+        assert not self.adapter._a2a_reply_chats
+
+    def test_bot_stream_dropped(self):
+        msg = {
+            "id": 602,
+            "sender_email": "peer-bot@example.com",
+            "sender_id": 99,
+            "type": "stream",
+            "content": ":satellite_antenna: stream chat",
+            "stream_id": 3,
+            "subject": "topic",
+            "display_recipient": "general",
+        }
+        assert self.adapter._accept_bot_inbound(msg) is False
+
+    def test_allowlisted_bot_bypasses_prefix(self):
+        self.adapter._allowed_bot_senders = {"peer-bot@example.com"}
+        msg = self._bot_dm("no prefix needed")
+        assert self.adapter._accept_bot_inbound(msg) is True
+
+    def test_policy_block_drops_bots(self):
+        self.adapter._bot_policy = "block"
+        msg = self._bot_dm(":satellite_antenna: still blocked")
+        assert self.adapter._accept_bot_inbound(msg) is False
+
+    def test_policy_allow_skips_gate(self):
+        self.adapter._bot_policy = "allow"
+        msg = self._bot_dm("anything")
+        assert self.adapter._accept_bot_inbound(msg) is True
+
+    @pytest.mark.asyncio
+    async def test_outbound_to_bot_dm_gets_a2a_prefix(self):
+        self.adapter._client = MagicMock()
+        self.adapter._build_send_client = MagicMock(return_value=self.adapter._client)
+        self.adapter._client.send_message.return_value = {
+            "result": "success",
+            "id": 9,
+        }
+        self.adapter._user_id_cache["peer-bot@example.com"] = 99
+
+        result = await self.adapter.send("dm:peer-bot@example.com", "status update")
+
+        assert result.success
+        sent = self.adapter._client.send_message.call_args[0][0]
+        assert sent["content"].startswith(":satellite_antenna: ")
+        assert "status update" in sent["content"]
+
+    @pytest.mark.asyncio
+    async def test_outbound_to_human_dm_no_a2a_prefix(self):
+        self.adapter._client = MagicMock()
+        self.adapter._build_send_client = MagicMock(return_value=self.adapter._client)
+        self.adapter._client.send_message.return_value = {
+            "result": "success",
+            "id": 9,
+        }
+        # alice is not in _bot_user_ids
+        self.adapter._user_id_cache["alice@example.com"] = 10
+
+        result = await self.adapter.send("dm:alice@example.com", "hello alice")
+
+        assert result.success
+        sent = self.adapter._client.send_message.call_args[0][0]
+        assert sent["content"] == "hello alice"
+
+    @pytest.mark.asyncio
+    async def test_outbound_group_dm_after_a2a_gets_prefix(self):
+        """After accepting A2A in a 2-bot+human room, replies keep the prefix."""
+        self.adapter._client = MagicMock()
+        self.adapter._build_send_client = MagicMock(return_value=self.adapter._client)
+        self.adapter._client.send_message.return_value = {
+            "result": "success",
+            "id": 9,
+        }
+        from plugins.platforms.zulip.adapter import _build_group_dm_chat_id
+        group_id = _build_group_dm_chat_id(
+            ["peer-bot@example.com", "human@example.com"]
+        )
+        self.adapter._a2a_reply_chats.add(group_id)
+
+        result = await self.adapter.send(group_id, "result for peer")
+
+        assert result.success
+        sent = self.adapter._client.send_message.call_args[0][0]
+        assert sent["content"].startswith(":satellite_antenna: ")
+        assert "result for peer" in sent["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -4173,6 +4420,128 @@ class TestZulipSendTyping:
             "type": "direct",
             "op": "stop",
         })
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_uses_sticky_target_without_reresolve(self):
+        """stop_typing must reuse the start payload when resolution would fail.
+
+        Base cleanup and gateway/run.py call stop_typing(chat_id) with no
+        metadata and no guarantee the user cache is warm. Sticky targets make
+        stop match the conversation that start actually notified.
+        """
+        adapter = _make_adapter()
+        adapter._client = MagicMock()
+        adapter._client.set_typing_status.return_value = {"result": "success"}
+        adapter._build_send_client = MagicMock(return_value=adapter._client)
+        adapter._user_id_cache["alice@example.com"] = 123
+
+        await adapter.send_typing("dm:alice@example.com")
+        # Simulate post-restart / cold-cache: resolution would fail now.
+        adapter._user_id_cache.clear()
+        adapter._client.call_endpoint.return_value = {
+            "result": "error",
+            "msg": "No such user",
+        }
+        adapter._client.get_users.return_value = {"result": "error", "msg": "nope"}
+        adapter._client.set_typing_status.reset_mock()
+
+        await adapter.stop_typing("dm:alice@example.com")
+
+        adapter._client.set_typing_status.assert_called_once_with({
+            "to": [123],
+            "type": "direct",
+            "op": "stop",
+        })
+        adapter._client.call_endpoint.assert_not_called()
+        assert "dm:alice@example.com" not in adapter._active_typing_targets
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_without_metadata_uses_sticky_stream_target(self):
+        """Named stream+topic started with metadata must stop without it."""
+        adapter = _make_adapter()
+        adapter._client = MagicMock()
+        adapter._client.set_typing_status.return_value = {"result": "success"}
+        adapter._build_send_client = MagicMock(return_value=adapter._client)
+        adapter._stream_id_cache = {"general": 42}
+
+        await adapter.send_typing("general", metadata={"thread_id": "announcements"})
+        adapter._client.set_typing_status.reset_mock()
+        # Drop stream cache so rebuild without sticky would need a network call.
+        adapter._stream_id_cache.clear()
+
+        await adapter.stop_typing("general")  # no metadata — base cleanup shape
+
+        adapter._client.set_typing_status.assert_called_once_with({
+            "stream_id": 42,
+            "topic": "announcements",
+            "type": "stream",
+            "op": "stop",
+        })
+
+    @pytest.mark.asyncio
+    async def test_typing_group_dm_resolves_all_user_ids(self):
+        """Group DMs need every participant id in the typing ``to`` list."""
+        adapter = _make_adapter()
+        adapter._client = MagicMock()
+        adapter._client.set_typing_status.return_value = {"result": "success"}
+        adapter._build_send_client = MagicMock(return_value=adapter._client)
+        adapter._user_id_cache = {
+            "alice@example.com": 10,
+            "bob@example.com": 20,
+        }
+
+        await adapter.send_typing("group_dm:alice@example.com,bob@example.com")
+
+        adapter._client.set_typing_status.assert_called_once_with({
+            "to": [10, 20],
+            "type": "direct",
+            "op": "start",
+        })
+
+    @pytest.mark.asyncio
+    async def test_typing_dm_dummy_api_email_needs_no_network(self):
+        """user{id}@realm emails embed the id — no GET /users needed."""
+        adapter = _make_adapter()
+        adapter._client = MagicMock()
+        adapter._client.set_typing_status.return_value = {"result": "success"}
+        adapter._build_send_client = MagicMock(return_value=adapter._client)
+
+        await adapter.send_typing("dm:user42@chat.example.com")
+
+        adapter._client.call_endpoint.assert_not_called()
+        adapter._client.set_typing_status.assert_called_once_with({
+            "to": [42],
+            "type": "direct",
+            "op": "start",
+        })
+        assert adapter._user_id_cache["user42@chat.example.com"] == 42
+
+    @pytest.mark.asyncio
+    async def test_resolve_user_falls_back_to_get_users_scan(self):
+        """When GET /users/{email} fails, scan get_users() for email match."""
+        adapter = _make_adapter()
+        adapter._client = MagicMock()
+        adapter._build_send_client = MagicMock(return_value=adapter._client)
+        adapter._client.call_endpoint.return_value = {
+            "result": "error",
+            "msg": "No such user",
+        }
+        adapter._client.get_users.return_value = {
+            "result": "success",
+            "members": [
+                {
+                    "user_id": 55,
+                    "email": "alice@example.com",
+                    "delivery_email": "alice.real@example.com",
+                },
+            ],
+        }
+
+        uid = adapter._resolve_user_id("alice.real@example.com")
+
+        assert uid == 55
+        assert adapter._user_id_cache["alice@example.com"] == 55
+        assert adapter._user_id_cache["alice.real@example.com"] == 55
 
     @pytest.mark.asyncio
     async def test_typing_without_client_is_silent(self):
