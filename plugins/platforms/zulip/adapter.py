@@ -23,6 +23,18 @@ Environment variables:
                              don't require @mention
     ZULIP_CONVERT_MATH       Rewrite common LaTeX delimiters to Zulip KaTeX
                              form before send (default: "true")
+    ZULIP_BOT_POLICY         Bot-to-bot policy: block | limited | allow
+                             (default: limited). Bot↔bot is private DMs only
+                             (1:1 or group) and requires the A2A prefix.
+    ZULIP_ALLOWED_BOT_SENDERS  Comma-separated bot emails that bypass the
+                             bot-to-bot gate entirely
+    ZULIP_A2A_PREFIX         Prefix for bot-to-bot messages
+                             (default: :satellite_antenna:)
+    ZULIP_BOT_RATE_MAX       Rate breaker max msgs (default: 5)
+    ZULIP_BOT_RATE_WINDOW    Rate window seconds (default: 30)
+    ZULIP_BOT_RATE_COOLDOWN  Rate cooldown seconds (default: 60)
+    ZULIP_BOT_REPEAT_K       Repetition breaker window (default: 3)
+    ZULIP_BOT_REPEAT_TRIVIAL_LEN  Max chars for "trivial" (default: 5)
 """
 
 from __future__ import annotations
@@ -54,6 +66,89 @@ logger = logging.getLogger(__name__)
 # realms may configure a different limit; keep Hermes at the standard maximum
 # so normal responses arrive as one message whenever the realm permits it.
 MAX_MESSAGE_LENGTH = 10_000
+
+
+# Bot-to-bot (agent-to-agent) opt-in marker.  Peer bots only process private
+# DM messages (1:1 or multi-party, e.g. 2 bots + 1 human) that start with
+# this prefix.  Outbound replies to known bot 1:1 DMs, or group DMs after an
+# A2A inbound, get the same prefix so the peer can answer.  Drop the prefix
+# (or stay silent) to end the exchange.  Streams never participate in bot2bot
+# under the default policy.
+#
+# Default is the Zulip emoji shortcode ``:satellite_antenna:`` (📡).  Inbound
+# matching also accepts the rendered Unicode glyph so clients that store the
+# emoji form still pass the gate.
+DEFAULT_A2A_PREFIX = ":satellite_antenna:"
+_A2A_UNICODE_GLYPH = "\U0001f4e1"  # 📡 SATELLITE ANTENNA
+
+
+def _a2a_prefix_matchers(prefix: str) -> Tuple[str, ...]:
+    """Return leading tokens that count as an A2A prefix for *prefix*."""
+    if not prefix:
+        return ()
+    matchers = [prefix]
+    if prefix == DEFAULT_A2A_PREFIX and _A2A_UNICODE_GLYPH not in matchers:
+        matchers.append(_A2A_UNICODE_GLYPH)
+    return tuple(matchers)
+
+
+def _has_a2a_prefix(content: str, prefix: str = DEFAULT_A2A_PREFIX) -> bool:
+    """Return True if *content* starts with the bot-to-bot prefix."""
+    if not content or not prefix:
+        return False
+    stripped = content.lstrip()
+    return any(stripped.startswith(m) for m in _a2a_prefix_matchers(prefix))
+
+
+def _strip_a2a_prefix(content: str, prefix: str = DEFAULT_A2A_PREFIX) -> str:
+    """Remove a leading A2A prefix (and one following space) from *content*."""
+    if not content or not prefix:
+        return content
+    stripped = content.lstrip()
+    for matcher in _a2a_prefix_matchers(prefix):
+        if stripped.startswith(matcher):
+            rest = stripped[len(matcher):]
+            if rest.startswith(" "):
+                rest = rest[1:]
+            return rest
+    return content
+
+
+def _ensure_a2a_prefix(content: str, prefix: str = DEFAULT_A2A_PREFIX) -> str:
+    """Guarantee *content* starts with the A2A prefix (idempotent)."""
+    if not content:
+        return f"{prefix}"
+    if _has_a2a_prefix(content, prefix):
+        body = _strip_a2a_prefix(content, prefix)
+        return f"{prefix} {body}" if body else prefix
+    body = content.strip()
+    return f"{prefix} {body}" if body else prefix
+
+
+def _is_private_message(message: Dict[str, Any]) -> bool:
+    """True when *message* is a Zulip private DM (1:1 or group)."""
+    return message.get("type") == "private"
+
+
+def _private_chat_id_from_message(
+    message: Dict[str, Any],
+    bot_email: str,
+) -> Optional[str]:
+    """Build Hermes chat_id for a private message (1:1 or group DM)."""
+    if not _is_private_message(message):
+        return None
+    sender_email = message.get("sender_email", "") or ""
+    recipients = _extract_dm_recipients(
+        message.get("display_recipient"),
+        bot_email,
+        sender_email,
+    )
+    if not recipients:
+        return None
+    if len(recipients) == 1:
+        return _build_dm_chat_id(recipients[0])
+    return _build_group_dm_chat_id(recipients)
+
 
 
 # Zulip KaTeX markup:
@@ -621,6 +716,44 @@ class ZulipAdapter(BasePlatformAdapter):
             "ZULIP_REQUIRE_MENTION", "true"
         ).lower() not in ("false", "0", "no")
 
+        # Bot-to-bot conversation policy — three modes:
+        #   block   → drop every inbound message from another realm bot
+        #   limited → private DMs only + A2A prefix + rate/repetition breakers
+        #   allow   → no bot filtering (dev/test only)
+        # ZULIP_ALLOWED_BOT_SENDERS bypasses the gate entirely.
+        policy_raw = os.getenv("ZULIP_BOT_POLICY", "limited").strip().lower()
+        self._bot_policy: str = (
+            policy_raw if policy_raw in ("block", "limited", "allow")
+            else "limited"
+        )
+        self._allowed_bot_senders: set = {
+            s.strip().lower()
+            for s in os.getenv("ZULIP_ALLOWED_BOT_SENDERS", "").split(",")
+            if s.strip()
+        }
+        self._a2a_prefix: str = (
+            os.getenv("ZULIP_A2A_PREFIX", DEFAULT_A2A_PREFIX).strip()
+            or DEFAULT_A2A_PREFIX
+        )
+        self._a2a_reply_chats: set = set()
+        self._bot_rate_max: int = int(
+            os.getenv("ZULIP_BOT_RATE_MAX", "5") or "5"
+        )
+        self._bot_rate_window: float = float(
+            os.getenv("ZULIP_BOT_RATE_WINDOW", "30") or "30"
+        )
+        self._bot_rate_cooldown: float = float(
+            os.getenv("ZULIP_BOT_RATE_COOLDOWN", "60") or "60"
+        )
+        self._bot_repeat_k: int = int(
+            os.getenv("ZULIP_BOT_REPEAT_K", "3") or "3"
+        )
+        self._bot_repeat_trivial_len: int = int(
+            os.getenv("ZULIP_BOT_REPEAT_TRIVIAL_LEN", "5") or "5"
+        )
+        self._bot_convo_state: Dict[tuple, dict] = {}
+
+
         free_streams_raw = os.getenv("ZULIP_FREE_RESPONSE_STREAMS", "")
         self._free_response_streams: set = {
             s.strip().lower()
@@ -713,6 +846,8 @@ class ZulipAdapter(BasePlatformAdapter):
         # (rare) case of an outbound DM typing indicator before any inbound
         # traffic from that user has been seen in the current process.
         self._user_id_cache: Dict[str, int] = {}
+        # Realm bot user_ids — populated by `_refresh_user_cache` for A2A gate.
+        self._bot_user_ids: set = set()
 
         # Graceful shutdown: event that wakes the event-queue thread
         # immediately when disconnect() is called, instead of waiting
@@ -802,9 +937,15 @@ class ZulipAdapter(BasePlatformAdapter):
             self._site_url,
         )
 
-        # Populate stream-id cache early (helps typing indicators on first messages).
+        # Populate stream/user caches early (typing + A2A bot detection).
         self._refresh_stream_cache()
-        logger.debug("Zulip: adapter fully connected and ready (stream cache has %d entries so far)", len(self._stream_id_cache))
+        self._refresh_user_cache()
+        logger.debug(
+            "Zulip: adapter fully connected and ready (stream cache=%d, user cache=%d, bots=%d)",
+            len(self._stream_id_cache),
+            len(self._user_id_cache),
+            len(self._bot_user_ids),
+        )
 
         # Start the event queue in a background thread.
         self._loop = asyncio.get_running_loop()
@@ -849,6 +990,9 @@ class ZulipAdapter(BasePlatformAdapter):
         self._stream_id_cache.clear()
         self._stream_name_cache.clear()
         self._user_id_cache.clear()
+        self._bot_user_ids.clear()
+        self._bot_convo_state.clear()
+        self._a2a_reply_chats.clear()
         self._consecutive_failures = 0
 
         self._mark_disconnected()
@@ -866,6 +1010,8 @@ class ZulipAdapter(BasePlatformAdapter):
             return SendResult(success=True)
 
         outbound_chat_id = self._metadata_adjusted_chat_id(chat_id, metadata)
+        # Bot-to-bot: 1:1 peer bot always; group DM after A2A inbound.
+        content = self._maybe_a2a_prefix_outbound(outbound_chat_id, content)
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, MAX_MESSAGE_LENGTH)
@@ -2063,6 +2209,11 @@ class ZulipAdapter(BasePlatformAdapter):
         if sender_email == self._bot_email or sender_id == self._bot_user_id:
             return
 
+        # Bot-to-bot guard (private DM + A2A prefix under policy=limited).
+        # May strip the A2A prefix from message["content"] in place.
+        if not self._accept_bot_inbound(message):
+            return
+
         # Schedule async processing on the main event loop.
         msg_type_log = message.get("type", "unknown")
         logger.debug(
@@ -2367,6 +2518,236 @@ class ZulipAdapter(BasePlatformAdapter):
                 )
         except Exception as exc:
             logger.warning("Zulip: failed to fetch streams — %s", exc)
+
+
+    def _accept_bot_inbound(self, message: dict) -> bool:
+        """Apply bot-to-bot policy; return True if *message* should be processed.
+
+        Supported bot↔bot surface (policy=limited):
+          * **private DMs only** — 1:1 **or** multi-party (e.g. 2 bots + 1 human)
+          * body must start with the configured A2A prefix
+            (default ``:satellite_antenna:``)
+          * prefix is stripped in place so the agent sees the payload only
+          * rate / repetition circuit breakers still apply on the stripped body
+          * chat is marked for A2A outbound so replies keep the prefix
+
+        Humans are never filtered here (no prefix required).  Streams drop
+        peer-bot messages under limited/block.
+        ``ZULIP_ALLOWED_BOT_SENDERS`` bypasses every check.
+        """
+        sender_id = message.get("sender_id", -1)
+        sender_email = (message.get("sender_email") or "").strip()
+        sender_email_l = sender_email.lower()
+
+        # Not a known realm bot → human (or uncached user); allow.
+        # Human traffic clears A2A-reply marking so later human-triggered
+        # replies in a group DM are not auto-prefixed.
+        if sender_id not in self._bot_user_ids:
+            chat_id = _private_chat_id_from_message(message, self._bot_email)
+            if chat_id:
+                self._a2a_reply_chats.discard(chat_id)
+            return True
+
+        if self._bot_policy == "allow":
+            return True
+
+        if sender_email_l and sender_email_l in self._allowed_bot_senders:
+            return True
+
+        if self._bot_policy == "block":
+            logger.info(
+                "Zulip: dropping bot message sender=%s (policy=block)",
+                sender_email or sender_id,
+            )
+            return False
+
+        # policy=limited: private DM (1:1 or group) + A2A prefix only.
+        if not _is_private_message(message):
+            logger.info(
+                "Zulip: dropping bot message sender=%s — bot-to-bot only "
+                "supported in private DMs (got type=%s)",
+                sender_email or sender_id,
+                message.get("type", "?"),
+            )
+            return False
+
+        content = message.get("content") or ""
+        if not _has_a2a_prefix(content, self._a2a_prefix):
+            logger.info(
+                "Zulip: dropping bot message sender=%s — missing %s prefix "
+                "(bot-to-bot opt-in required in private DMs)",
+                sender_email or sender_id,
+                self._a2a_prefix,
+            )
+            return False
+
+        # Strip prefix before the agent; breakers see the payload only.
+        message["content"] = _strip_a2a_prefix(content, self._a2a_prefix)
+        if not (message.get("content") or "").strip():
+            logger.debug(
+                "Zulip: dropping empty bot A2A message sender=%s",
+                sender_email or sender_id,
+            )
+            return False
+
+        if not self._bot_conversation_allowed(message):
+            return False
+
+        chat_id = _private_chat_id_from_message(message, self._bot_email)
+        if chat_id:
+            self._a2a_reply_chats.add(chat_id)
+        return True
+
+    def _peer_is_bot_dm(self, chat_id: str) -> bool:
+        """True when *chat_id* is a 1:1 DM whose peer is a known realm bot."""
+        if is_group_dm_chat_id(chat_id):
+            return False
+        dm_email = _parse_dm_chat_id(chat_id)
+        if not dm_email:
+            return False
+        key = dm_email.lower()
+        uid = self._user_id_cache.get(key)
+        if uid is not None and uid in self._bot_user_ids:
+            return True
+        if key in self._allowed_bot_senders:
+            return True
+        return False
+
+    def _maybe_a2a_prefix_outbound(self, chat_id: str, content: str) -> str:
+        """Prefix outbound bodies that continue a bot-to-bot exchange.
+
+        * 1:1 DM to a known peer bot → always prefix
+        * group DM marked after A2A inbound → prefix (2 bots + human room)
+        * human 1:1 / human-triggered group replies → no prefix
+        """
+        if not content:
+            return content
+        need_prefix = (
+            self._peer_is_bot_dm(chat_id)
+            or chat_id in self._a2a_reply_chats
+        )
+        if not need_prefix:
+            return content
+        return _ensure_a2a_prefix(content, self._a2a_prefix)
+
+    def _bot_conversation_allowed(self, message: dict) -> bool:
+        """Circuit breakers for bot-to-bot conversations (policy=limited).
+
+        Returns True if the message should be processed, False to drop it.
+        Two breakers, keyed per (sender_user_id, conversation):
+
+        (1) Rate breaker (SOFT): more than _bot_rate_max messages within
+            _bot_rate_window seconds → cool down for _bot_rate_cooldown seconds.
+        (2) Repetition breaker (HARD): last _bot_repeat_k messages are all
+            identical, OR all short enough (≤ _bot_repeat_trivial_len chars).
+            Sticky until process restart.
+        """
+        from collections import deque
+        now = time.time()
+        sender_id = message.get("sender_id", -1)
+
+        convo_key = (
+            sender_id,
+            "dm",
+            message.get("recipient_id", 0),
+        )
+
+        state = self._bot_convo_state.get(convo_key)
+        if state is None:
+            state = {
+                "timestamps": deque(maxlen=max(self._bot_rate_max * 4, 20)),
+                "contents": deque(maxlen=max(self._bot_repeat_k, 3)),
+                "total": 0,
+                "blocked_until": 0.0,
+                "hard_blocked": False,
+            }
+            self._bot_convo_state[convo_key] = state
+
+        sender_email = message.get("sender_email", "?")
+
+        if state["hard_blocked"]:
+            logger.debug(
+                "Zulip: bot msg dropped (hard-blocked convo) sender=%s key=%s",
+                sender_email, convo_key,
+            )
+            return False
+
+        if now < state["blocked_until"]:
+            remaining = int(state["blocked_until"] - now)
+            logger.debug(
+                "Zulip: bot msg dropped (rate cooldown %ds left) sender=%s",
+                remaining, sender_email,
+            )
+            return False
+
+        state["timestamps"].append(now)
+        content = (message.get("content") or "").strip()
+        state["contents"].append(content)
+        state["total"] += 1
+
+        window_start = now - self._bot_rate_window
+        recent = sum(1 for t in state["timestamps"] if t >= window_start)
+        if recent > self._bot_rate_max:
+            state["blocked_until"] = now + self._bot_rate_cooldown
+            logger.warning(
+                "Zulip: bot-conversation rate breaker tripped — %d msgs in %.0fs "
+                "from %s; cooling down %.0fs. key=%s",
+                recent, self._bot_rate_window, sender_email,
+                self._bot_rate_cooldown, convo_key,
+            )
+            return False
+
+        if len(state["contents"]) >= self._bot_repeat_k:
+            last_k = list(state["contents"])[-self._bot_repeat_k:]
+            all_trivial = all(
+                len(c) <= self._bot_repeat_trivial_len for c in last_k
+            )
+            all_same = len(set(last_k)) == 1
+            if all_trivial or all_same:
+                state["hard_blocked"] = True
+                logger.warning(
+                    "Zulip: bot-conversation repetition breaker tripped — "
+                    "last %d msgs from %s were %s. HARD-blocking convo "
+                    "until gateway restart. key=%s samples=%r",
+                    self._bot_repeat_k, sender_email,
+                    "identical" if all_same else "all trivial",
+                    convo_key, last_k,
+                )
+                return False
+
+        return True
+
+    def _refresh_user_cache(self) -> None:
+        """Fetch organization users: email→id for typing + bot ids for A2A."""
+        if not self._client:
+            return
+        try:
+            result = self._client.get_users()
+            if result.get("result") != "success":
+                return
+            bot_ids: set = set()
+            for user in result.get("members", []):
+                uid = user.get("user_id")
+                if not uid:
+                    continue
+                if user.get("is_bot"):
+                    bot_ids.add(int(uid))
+                for email_key in (
+                    user.get("email"),
+                    user.get("delivery_email"),
+                ):
+                    if email_key and "@" in str(email_key):
+                        self._user_id_cache[str(email_key).lower()] = int(uid)
+            self._bot_user_ids = bot_ids
+            if self._user_id_cache or bot_ids:
+                logger.info(
+                    "Zulip: cached %d user email(s) for typing "
+                    "(%d bot(s))",
+                    len(self._user_id_cache),
+                    len(bot_ids),
+                )
+        except Exception as exc:
+            logger.warning("Zulip: failed to fetch users — %s", exc)
 
     def _prune_seen(self) -> None:
         """Remove expired entries from the dedup cache."""
