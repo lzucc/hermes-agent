@@ -700,6 +700,46 @@ def _core_constraints_file() -> Optional[Path]:
         return None
 
 
+# Package names whose installs must bypass HTTP(S)/ALL proxies.  On some
+# networks (e.g. corporate/home SOCKS proxies good for GitHub but broken or
+# glacially slow for PyPI) a proxy-aware uv/pip install of these packages
+# times out; direct egress works.  Specs are matched by package name only
+# (version pins / extras stripped).
+_SKIP_PROXY_PACKAGES = frozenset({"lark-oapi", "lark_oapi"})
+_PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+)
+
+
+def _spec_package_name(spec: str) -> str:
+    """Extract the bare package name from a pip-style requirement string."""
+    # "lark-oapi==1.6.8" / "lark-oapi>=1" / "lark-oapi[foo]==1" → "lark-oapi"
+    name = (spec or "").strip()
+    for sep in ("==", ">=", "<=", "~=", "!=", ">", "<", "["):
+        if sep in name:
+            name = name.split(sep, 1)[0]
+    return name.strip().lower()
+
+
+def _specs_should_skip_proxy(specs: tuple[str, ...]) -> bool:
+    return any(_spec_package_name(s) in _SKIP_PROXY_PACKAGES for s in specs)
+
+
+def _strip_proxy_env(env: dict) -> dict:
+    """Return a copy of *env* with HTTP(S)/ALL proxy variables removed."""
+    cleaned = dict(env)
+    for key in _PROXY_ENV_KEYS:
+        cleaned.pop(key, None)
+    return cleaned
+
+
 def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _InstallResult:
     """Install ``specs`` using the uv → pip → ensurepip ladder.
 
@@ -715,6 +755,10 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
 
     Mirrors the strategy in ``hermes_cli.tools_config._pip_install`` but
     kept independent here so this module has no CLI dependency.
+
+    Proxy handling: installs that include ``lark-oapi`` clear
+    HTTP(S)/ALL_PROXY from the child env so a SOCKS proxy that is fine for
+    GitHub but unusable for PyPI does not stall the Feishu backend install.
     """
     if not specs:
         return _InstallResult(True, "", "")
@@ -739,8 +783,14 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
     try:
         venv_root = Path(sys.executable).parent.parent
         from tools.environments.local import hermes_subprocess_env
-        uv_env = hermes_subprocess_env(inherit_credentials=False)
-        uv_env["VIRTUAL_ENV"] = str(venv_root)
+        install_env = hermes_subprocess_env(inherit_credentials=False)
+        install_env["VIRTUAL_ENV"] = str(venv_root)
+        if _specs_should_skip_proxy(specs):
+            install_env = _strip_proxy_env(install_env)
+            logger.debug(
+                "Skipping HTTP(S)/ALL proxy for lazy install of %s",
+                ", ".join(specs),
+            )
 
         # Tier 1: uv (preferred — fast, doesn't need pip in the venv)
         # Managed uv first: $HERMES_HOME/bin is never on PATH, so a bare
@@ -759,7 +809,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
             try:
                 r = subprocess.run(
                     [uv_bin, "pip", "install", *target_args, *constraint_args, *specs],
-                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, env=uv_env,
+                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, env=install_env,
                     stdin=subprocess.DEVNULL,
                     creationflags=windows_hide_flags(),
                 )
@@ -789,6 +839,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15,
                 stdin=subprocess.DEVNULL,
                 creationflags=windows_hide_flags(),
+                env=install_env,
             )
             if probe.returncode != 0:
                 raise FileNotFoundError("pip not in venv")
@@ -799,6 +850,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                     capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120, check=True,
                     stdin=subprocess.DEVNULL,
                     creationflags=windows_hide_flags(),
+                    env=install_env,
                 )
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                 return _InstallResult(False, "",
@@ -810,6 +862,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout,
                 stdin=subprocess.DEVNULL,
                 creationflags=windows_hide_flags(),
+                env=install_env,
             )
             if r.returncode == 0 and target is not None:
                 _activate_target_on_syspath(target)

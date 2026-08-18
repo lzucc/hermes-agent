@@ -483,3 +483,40 @@ class TestInstallSpecs:
         result = ld.install_specs(["honcho-ai==2.2.0"])
         assert result.ok is False
         assert "disk on fire" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Proxy bypass for lark-oapi
+# ---------------------------------------------------------------------------
+
+
+class TestSkipProxyForLarkOapi:
+    def test_spec_package_name_strips_pin(self):
+        assert ld._spec_package_name("lark-oapi==1.6.8") == "lark-oapi"
+        assert ld._spec_package_name("lark-oapi>=1.0,<2") == "lark-oapi"
+        assert ld._spec_package_name("lark-oapi[foo]==1.6.8") == "lark-oapi"
+
+    def test_specs_should_skip_proxy_for_lark(self):
+        assert ld._specs_should_skip_proxy(("lark-oapi==1.6.8",))
+        assert ld._specs_should_skip_proxy(("qrcode==7.4.2", "lark-oapi==1.6.8"))
+        assert not ld._specs_should_skip_proxy(("zulip==0.9.1",))
+        assert not ld._specs_should_skip_proxy(("qrcode==7.4.2",))
+
+    def test_strip_proxy_env_removes_proxy_keys(self):
+        env = {
+            "PATH": "/usr/bin",
+            "HTTP_PROXY": "socks5h://127.0.0.1:1080",
+            "HTTPS_PROXY": "socks5h://127.0.0.1:1080",
+            "http_proxy": "socks5h://127.0.0.1:1080",
+            "https_proxy": "socks5h://127.0.0.1:1080",
+            "ALL_PROXY": "socks5h://127.0.0.1:1080",
+            "all_proxy": "socks5h://127.0.0.1:1080",
+            "NO_PROXY": "localhost",
+            "no_proxy": "localhost",
+            "VIRTUAL_ENV": "/tmp/venv",
+        }
+        cleaned = ld._strip_proxy_env(env)
+        assert cleaned["PATH"] == "/usr/bin"
+        assert cleaned["VIRTUAL_ENV"] == "/tmp/venv"
+        for key in ld._PROXY_ENV_KEYS:
+            assert key not in cleaned
